@@ -1,6 +1,6 @@
 //! TCP SNI passthrough router on 127.0.0.1:443.
 
-use crate::sni_tls::parse_sni_hostname;
+use crate::sni_tls::await_routing_hostname;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -57,13 +57,10 @@ async fn run_listener(port: u16, resolve: ResolveFn, mut shutdown: watch::Receiv
                 let Ok((mut client, _)) = accept else { break };
                 let resolve = resolve.clone();
                 tokio::spawn(async move {
-                    let mut peek = [0u8; 4096];
-                    let n = match client.peek(&mut peek).await {
-                        Ok(n) => n,
-                        Err(_) => return,
+                    let Some(hostname) = await_routing_hostname(&mut client).await else {
+                        tracing::warn!("SNI: could not determine hostname on port {port}");
+                        return;
                     };
-                    let hostname = parse_sni_hostname(&peek[..n])
-                        .unwrap_or_else(|| "localhost".to_string());
                     let Some(backend_port) = resolve(port, &hostname) else {
                         tracing::warn!("SNI: no route for {hostname}:{port}");
                         return;

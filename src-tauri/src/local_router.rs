@@ -1,16 +1,11 @@
-//! Global local routing orchestrator — hosts, SNI/HTTP routers, internal port pool.
+//! Global local routing orchestrator — hosts, per-domain loopback IPs, SSH bind.
 
 use crate::hosts;
-use crate::http_router::{HttpRouter, ResolveFn as HttpResolveFn};
 use crate::model::ForwardMapping;
-use crate::sni_proxy::SniProxy;
 use anyhow::{bail, Context, Result};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-
-const PORT_POOL_START: u16 = 49100;
-const PORT_POOL_END: u16 = 49999;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct RouteKey {
@@ -20,7 +15,7 @@ struct RouteKey {
 
 #[derive(Debug, Clone)]
 struct RouteEntry {
-    internal_port: u16,
+    loopback_ip: String,
     remote_port: u16,
     refs: u32,
 }
@@ -47,12 +42,8 @@ pub struct LocalRouter {
 }
 
 struct RouterState {
-    domain_refs: HashMap<String, u32>,
     tunnel_regs: HashMap<String, Vec<TunnelRegistration>>,
-    used_ports: HashSet<u16>,
-    sni_proxy: Option<SniProxy>,
-    http_routers: HashMap<u16, HttpRouter>,
-    resolve: HttpResolveFn,
+    used_ips: HashSet<String>,
 }
 
 impl Default for LocalRouter {
@@ -63,27 +54,11 @@ impl Default for LocalRouter {
 
 impl LocalRouter {
     pub fn new() -> Self {
-        let routes = Arc::new(Mutex::new(HashMap::new()));
-        let routes_for_resolve = routes.clone();
-        let resolve: HttpResolveFn = Arc::new(move |public_port, hostname| {
-            let key = RouteKey {
-                hostname: hostname.to_ascii_lowercase(),
-                public_port,
-            };
-            routes_for_resolve
-                .lock()
-                .get(&key)
-                .map(|e: &RouteEntry| e.internal_port)
-        });
         Self {
-            routes,
+            routes: Arc::new(Mutex::new(HashMap::new())),
             inner: Mutex::new(RouterState {
-                domain_refs: HashMap::new(),
                 tunnel_regs: HashMap::new(),
-                used_ports: HashSet::new(),
-                sni_proxy: None,
-                http_routers: HashMap::new(),
-                resolve,
+                used_ips: HashSet::new(),
             }),
         }
     }
@@ -129,47 +104,28 @@ impl LocalRouter {
                 continue;
             }
 
-            let hostname = remote_host.to_ascii_lowercase();
+            let hostname = normalize_hostname(remote_host);
             let public_port = mapping.remote_port;
+            let loopback_ip = reserve_domain_route(
+                &mut routes,
+                &mut state,
+                &hostname,
+                public_port,
+            )?;
+
             let key = RouteKey {
                 hostname: hostname.clone(),
                 public_port,
             };
 
-            let internal_port = if let Some(existing) = routes.get(&key) {
-                if existing.remote_port != mapping.remote_port {
-                    bail!(
-                        "domain conflict: {hostname}:{public_port} is already routed to port {}",
-                        existing.remote_port
-                    );
-                }
-                let internal_port = existing.internal_port;
-                routes.get_mut(&key).unwrap().refs += 1;
-                internal_port
-            } else {
-                let internal_port = state
-                    .allocate_port()
-                    .context("internal port pool exhausted (49100–49999)")?;
-                routes.insert(
-                    key.clone(),
-                    RouteEntry {
-                        internal_port,
-                        remote_port: mapping.remote_port,
-                        refs: 1,
-                    },
-                );
-                internal_port
-            };
-
-            *state.domain_refs.entry(hostname.clone()).or_insert(0) += 1;
             let access_url = format_access_url(&hostname, public_port);
 
             pending.push(TunnelRegistration { key });
             activated.push(ActivatedMapping {
                 mapping_id: mapping.id.clone(),
-                bind_host: "127.0.0.1".into(),
-                bind_port: internal_port,
-                remote_host: remote_host.to_string(),
+                bind_host: loopback_ip.clone(),
+                bind_port: public_port,
+                remote_host: hostname.clone(),
                 remote_port: mapping.remote_port,
                 access_url,
             });
@@ -177,14 +133,14 @@ impl LocalRouter {
 
         drop(routes);
         state.tunnel_regs.insert(tunnel_id.to_string(), pending);
-        state.sync_hosts_locked()?;
-        state.ensure_routers_locked(&self.routes)?;
+        state.sync_hosts_locked(&self.routes)?;
 
         for m in &activated {
             if !is_ip_address(&m.remote_host) {
                 tracing::info!(
-                    "routing {} → 127.0.0.1:{}",
-                    format_access_url(&m.remote_host.to_ascii_lowercase(), m.remote_port),
+                    "routing {} → {}:{}",
+                    format_access_url(&normalize_hostname(&m.remote_host), m.remote_port),
+                    m.bind_host,
                     m.bind_port
                 );
             }
@@ -204,126 +160,153 @@ impl LocalRouter {
             if let Some(entry) = routes.get_mut(&reg.key) {
                 entry.refs = entry.refs.saturating_sub(1);
                 if entry.refs == 0 {
-                    let internal = entry.internal_port;
+                    let ip = entry.loopback_ip.clone();
                     routes.remove(&reg.key);
-                    state.used_ports.remove(&internal);
-                }
-            }
-            if let Some(count) = state.domain_refs.get_mut(&reg.key.hostname) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    state.domain_refs.remove(&reg.key.hostname);
+                    state.used_ips.remove(&ip);
                 }
             }
         }
 
         drop(routes);
-        let _ = state.sync_hosts_locked();
-        state.stop_unused_routers_locked(&self.routes);
+        let _ = state.sync_hosts_locked(&self.routes);
     }
 
     pub fn shutdown_all(&self) {
         let mut state = self.inner.lock();
         self.routes.lock().clear();
         state.tunnel_regs.clear();
-        state.domain_refs.clear();
-        state.used_ports.clear();
-        if let Some(mut proxy) = state.sni_proxy.take() {
-            proxy.stop();
-        }
-        for (_, mut router) in state.http_routers.drain() {
-            router.stop();
-        }
+        state.used_ips.clear();
         // Skip hosts sync on quit — `elevation::write_hosts_file` can block for
         // seconds (UAC / PowerShell) and freezes the window. Orphans are removed
         // on the next launch via `bootstrap()`.
     }
+
+    #[cfg(test)]
+    fn route_loopback_ip(&self, public_port: u16, hostname: &str) -> Option<String> {
+        let key = RouteKey {
+            hostname: normalize_hostname(hostname),
+            public_port,
+        };
+        self.routes.lock().get(&key).map(|e| e.loopback_ip.clone())
+    }
 }
 
 impl RouterState {
-    fn allocate_port(&mut self) -> Option<u16> {
-        for port in PORT_POOL_START..=PORT_POOL_END {
-            if !self.used_ports.contains(&port) {
-                self.used_ports.insert(port);
-                return Some(port);
-            }
-        }
-        None
-    }
-
-    fn sync_hosts_locked(&self) -> Result<()> {
-        hosts::sync_domains(&self.domain_refs)
-    }
-
-    fn ensure_routers_locked(
-        &mut self,
+    fn sync_hosts_locked(
+        &self,
         routes: &Arc<Mutex<HashMap<RouteKey, RouteEntry>>>,
     ) -> Result<()> {
-        let needs_sni = routes.lock().keys().any(|k| k.public_port == 443);
-
-        if needs_sni && self.sni_proxy.is_none() {
-            let resolve = self.resolve.clone();
-            self.sni_proxy = Some(SniProxy::start(resolve).context(
-                "starting SNI router on 127.0.0.1:443 (is another service using port 443?)",
-            )?);
-        }
-
-        let http_ports: HashSet<u16> = routes
+        let mut entries: Vec<(String, String)> = routes
             .lock()
-            .keys()
-            .filter(|k| k.public_port != 443)
-            .map(|k| k.public_port)
+            .iter()
+            .map(|(k, e)| (e.loopback_ip.clone(), k.hostname.clone()))
             .collect();
-
-        for port in http_ports {
-            if !self.http_routers.contains_key(&port) {
-                let resolve = self.resolve.clone();
-                let router = HttpRouter::start(port, resolve).with_context(|| {
-                    format!("starting HTTP router on 127.0.0.1:{port}")
-                })?;
-                self.http_routers.insert(port, router);
-            }
-        }
-        Ok(())
-    }
-
-    fn stop_unused_routers_locked(
-        &mut self,
-        routes: &Arc<Mutex<HashMap<RouteKey, RouteEntry>>>,
-    ) {
-        let routes_guard = routes.lock();
-        let needs_sni = routes_guard.keys().any(|k| k.public_port == 443);
-        drop(routes_guard);
-
-        if !needs_sni {
-            if let Some(mut proxy) = self.sni_proxy.take() {
-                proxy.stop();
-            }
-        }
-
-        let active_http: HashSet<u16> = routes
-            .lock()
-            .keys()
-            .filter(|k| k.public_port != 443)
-            .map(|k| k.public_port)
-            .collect();
-
-        let stale: Vec<u16> = self
-            .http_routers
-            .keys()
-            .filter(|p| !active_http.contains(p))
-            .copied()
-            .collect();
-        for port in stale {
-            if let Some(mut router) = self.http_routers.remove(&port) {
-                router.stop();
-            }
-        }
+        entries.sort_by(|a, b| a.1.cmp(&b.1));
+        hosts::sync_domains(&entries)
     }
 }
 
 fn is_ip_address(host: &str) -> bool {
     host.parse::<std::net::IpAddr>().is_ok()
+}
+
+fn reserve_domain_route(
+    routes: &mut HashMap<RouteKey, RouteEntry>,
+    state: &mut RouterState,
+    remote_host: &str,
+    remote_port: u16,
+) -> Result<String> {
+    let hostname = normalize_hostname(remote_host);
+    let public_port = remote_port;
+    let key = RouteKey {
+        hostname: hostname.clone(),
+        public_port,
+    };
+
+    if let Some(existing) = routes.get(&key) {
+        if existing.remote_port != remote_port {
+            bail!(
+                "domain conflict: {hostname}:{public_port} is already routed to port {}",
+                existing.remote_port
+            );
+        }
+        let loopback_ip = existing.loopback_ip.clone();
+        routes.get_mut(&key).unwrap().refs += 1;
+        return Ok(loopback_ip);
+    }
+
+    let loopback_ip = allocate_loopback_ip(state, public_port, routes)
+        .context("loopback IP pool exhausted (127.0.0.2–127.0.0.254)")?;
+    routes.insert(
+        key,
+        RouteEntry {
+            loopback_ip: loopback_ip.clone(),
+            remote_port,
+            refs: 1,
+        },
+    );
+    Ok(loopback_ip)
+}
+
+/// Pick a loopback IP for `public_port`. The first domain on a port uses 127.0.0.1;
+/// additional domains on the same port get distinct IPs so browsers cannot coalesce
+/// TLS connections (which would bypass per-connection SNI routing).
+fn allocate_loopback_ip(
+    state: &mut RouterState,
+    public_port: u16,
+    routes: &HashMap<RouteKey, RouteEntry>,
+) -> Option<String> {
+    let ips_on_port: HashSet<&str> = routes
+        .iter()
+        .filter(|(k, _)| k.public_port == public_port)
+        .map(|(_, e)| e.loopback_ip.as_str())
+        .collect();
+
+    if !ips_on_port.contains("127.0.0.1") {
+        state.used_ips.insert("127.0.0.1".into());
+        return Some("127.0.0.1".into());
+    }
+
+    for n in 2..=254 {
+        let ip = format!("127.0.0.{n}");
+        if !state.used_ips.contains(&ip) && !ips_on_port.contains(ip.as_str()) {
+            state.used_ips.insert(ip.clone());
+            return Some(ip);
+        }
+    }
+    None
+}
+
+/// Normalize a user-supplied hostname so it matches SNI / HTTP Host lookups.
+fn normalize_hostname(raw: &str) -> String {
+    let mut s = raw.trim();
+    if let Some(rest) = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+    {
+        s = rest;
+    }
+    s = s.split('/').next().unwrap_or(s).trim();
+
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some((ip, after)) = rest.split_once(']') {
+            let host = format!("[{ip}]");
+            if let Some(port) = after.strip_prefix(':') {
+                if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+                    return host.to_ascii_lowercase();
+                }
+            }
+            return host.to_ascii_lowercase();
+        }
+    }
+
+    if let Some((host, port)) = s.rsplit_once(':') {
+        if !host.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+            return host.trim_end_matches('.').to_ascii_lowercase();
+        }
+    }
+
+    s.trim_end_matches('.').to_ascii_lowercase()
 }
 
 fn format_access_url(host: &str, port: u16) -> String {
@@ -333,3 +316,99 @@ fn format_access_url(host: &str, port: u16) -> String {
         _ => format!("https://{host}:{port}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_hostname_strips_scheme_port_and_trailing_dot() {
+        assert_eq!(
+            normalize_hostname("https://GitLab.Example.com:443/"),
+            "gitlab.example.com"
+        );
+        assert_eq!(normalize_hostname("app.example.com."), "app.example.com");
+        assert_eq!(normalize_hostname("app.example.com:8443"), "app.example.com");
+    }
+
+    #[test]
+    fn two_domains_on_same_public_port_get_distinct_loopback_ips() {
+        let router = LocalRouter::new();
+        let ip1;
+        let ip2;
+        {
+            let mut routes = router.routes.lock();
+            let mut state = router.inner.lock();
+            ip1 = reserve_domain_route(&mut routes, &mut state, "app1.example.com", 443).unwrap();
+            ip2 = reserve_domain_route(&mut routes, &mut state, "app2.example.com", 443).unwrap();
+        }
+
+        assert_ne!(ip1, ip2);
+        assert_eq!(
+            router.route_loopback_ip(443, "app1.example.com"),
+            Some(ip1.clone())
+        );
+        assert_eq!(
+            router.route_loopback_ip(443, "app2.example.com"),
+            Some(ip2.clone())
+        );
+    }
+
+    #[test]
+    fn first_domain_on_port_uses_loopback_one() {
+        let router = LocalRouter::new();
+        let ip = {
+            let mut routes = router.routes.lock();
+            let mut state = router.inner.lock();
+            reserve_domain_route(&mut routes, &mut state, "only.example.com", 443).unwrap()
+        };
+        assert_eq!(ip, "127.0.0.1");
+    }
+
+    #[test]
+    fn different_ports_can_share_loopback_one() {
+        let router = LocalRouter::new();
+        let ip443;
+        let ip8443;
+        {
+            let mut routes = router.routes.lock();
+            let mut state = router.inner.lock();
+            ip443 = reserve_domain_route(&mut routes, &mut state, "a.example.com", 443).unwrap();
+            ip8443 = reserve_domain_route(&mut routes, &mut state, "b.example.com", 8443).unwrap();
+        }
+        assert_eq!(ip443, "127.0.0.1");
+        assert_eq!(ip8443, "127.0.0.1");
+    }
+
+    #[test]
+    fn hostname_with_embedded_port_matches_lookup() {
+        let router = LocalRouter::new();
+        let ip = {
+            let mut routes = router.routes.lock();
+            let mut state = router.inner.lock();
+            reserve_domain_route(&mut routes, &mut state, "app1.example.com:443", 443).unwrap()
+        };
+        assert_eq!(router.route_loopback_ip(443, "app1.example.com"), Some(ip));
+    }
+
+    #[test]
+    fn resolve_normalizes_lookup_hostname() {
+        let router = LocalRouter::new();
+        let ip = {
+            let mut routes = router.routes.lock();
+            let mut state = router.inner.lock();
+            reserve_domain_route(
+                &mut routes,
+                &mut state,
+                "https://App1.Example.com:443/",
+                443,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            router.route_loopback_ip(443, "app1.example.com"),
+            Some(ip)
+        );
+    }
+}
+

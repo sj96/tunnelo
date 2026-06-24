@@ -1,5 +1,6 @@
 //! TCP Host-header passthrough router for HTTP on 127.0.0.1:80 (and custom ports).
 
+use crate::sni_tls::await_routing_hostname;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -56,13 +57,10 @@ async fn run_listener(port: u16, resolve: ResolveFn, mut shutdown: watch::Receiv
                 let Ok((mut client, _)) = accept else { break };
                 let resolve = resolve.clone();
                 tokio::spawn(async move {
-                    let mut peek = [0u8; 4096];
-                    let n = match client.peek(&mut peek).await {
-                        Ok(n) => n,
-                        Err(_) => return,
+                    let Some(hostname) = await_routing_hostname(&mut client).await else {
+                        tracing::warn!("HTTP: could not determine hostname on port {port}");
+                        return;
                     };
-                    let hostname = parse_host_header(&peek[..n])
-                        .unwrap_or_else(|| "localhost".to_string());
                     let Some(backend_port) = resolve(port, &hostname) else {
                         tracing::warn!("HTTP: no route for {hostname}:{port}");
                         return;
@@ -78,23 +76,6 @@ async fn run_listener(port: u16, resolve: ResolveFn, mut shutdown: watch::Receiv
             }
         }
     }
-}
-
-/// Extract hostname from the first HTTP request line's Host header.
-fn parse_host_header(data: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(data).ok()?;
-    for line in text.split("\r\n") {
-        if let Some(rest) = line.strip_prefix("Host:").or_else(|| line.strip_prefix("host:")) {
-            let host = rest.trim().split(':').next()?.trim();
-            if !host.is_empty() {
-                return Some(host.to_ascii_lowercase());
-            }
-        }
-        if line.is_empty() {
-            break;
-        }
-    }
-    None
 }
 
 async fn proxy_bidirectional(a: &mut TcpStream, b: &mut TcpStream) -> Result<()> {

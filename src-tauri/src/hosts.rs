@@ -2,7 +2,6 @@
 
 use crate::elevation;
 use anyhow::{Context, Result};
-use std::collections::HashMap;
 #[cfg(windows)]
 use std::path::Path;
 use std::path::PathBuf;
@@ -72,8 +71,8 @@ pub fn cleanup_orphans() -> Result<()> {
         .with_context(|| format!("cleaning orphan hosts entries in {}", path.display()))
 }
 
-/// Sync the hosts file to match the desired domain → ref-count map.
-pub fn sync_domains(domains: &HashMap<String, u32>) -> Result<()> {
+/// Sync the hosts file to match active domain routes (`loopback_ip`, `hostname`).
+pub fn sync_domains(entries: &[(String, String)]) -> Result<()> {
     let path = hosts_path();
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {}", path.display()))?;
@@ -84,11 +83,8 @@ pub fn sync_domains(domains: &HashMap<String, u32>) -> Result<()> {
         .map(|s| s.to_string())
         .collect();
 
-    let mut sorted: Vec<_> = domains.iter().filter(|(_, &c)| c > 0).collect();
-    sorted.sort_by_key(|(h, _)| h.as_str());
-
-    for (host, _) in sorted {
-        kept.push(format!("127.0.0.1 {host} {MARKER}"));
+    for (ip, host) in entries {
+        kept.push(format!("{ip} {host} {MARKER}"));
     }
 
     let mut new_content = kept.join("\n");

@@ -19,6 +19,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::copy_bidirectional;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 use russh::client::{self, Handle};
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
@@ -286,24 +287,30 @@ async fn run_tunnel(
         .get_resolved_bastion(id)
         .unwrap_or_else(|| profile.ssh.host.clone());
 
+    let (forward_shutdown, forward_shutdown_rx) = watch::channel(false);
+    let mut forward_tasks = Vec::with_capacity(bindings.len());
+
     for mapping in bindings {
-        spawn_local_forward(
-            app,
-            id.clone(),
-            session.clone(),
-            shutdown.clone(),
-            mapping.bind_host.clone(),
-            mapping.bind_port,
-            mapping.remote_host.clone(),
-            mapping.remote_port,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "binding local {}:{}",
-                mapping.bind_host, mapping.bind_port
+        forward_tasks.push(
+            spawn_local_forward(
+                app,
+                id.clone(),
+                session.clone(),
+                shutdown.clone(),
+                forward_shutdown_rx.clone(),
+                mapping.bind_host.clone(),
+                mapping.bind_port,
+                mapping.remote_host.clone(),
+                mapping.remote_port,
             )
-        })?;
+            .await
+            .with_context(|| {
+                format!(
+                    "binding local {}:{}",
+                    mapping.bind_host, mapping.bind_port
+                )
+            })?,
+        );
         emit_log(
             app,
             id,
@@ -358,6 +365,10 @@ async fn run_tunnel(
 
     if matches!(outcome, Outcome::Shutdown) {
         emit_log(app, id, LogLevel::Info, "Shutting down");
+    }
+    let _ = forward_shutdown.send(true);
+    for task in forward_tasks {
+        let _ = task.await;
     }
     Ok(outcome)
 }
@@ -497,21 +508,27 @@ async fn spawn_local_forward(
     app: &AppHandle,
     id: String,
     session: Arc<Handle<ClientHandler>>,
-    mut shutdown: watch::Receiver<bool>,
+    mut tunnel_shutdown: watch::Receiver<bool>,
+    mut session_shutdown: watch::Receiver<bool>,
     local_host: String,
     local_port: u16,
     remote_host: String,
     remote_port: u16,
-) -> Result<()> {
+) -> Result<JoinHandle<()>> {
     let listener = TcpListener::bind((local_host.as_str(), local_port))
         .await
         .with_context(|| format!("binding {local_host}:{local_port}"))?;
     let app = app.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
+                changed = tunnel_shutdown.changed() => {
+                    if changed.is_err() || *tunnel_shutdown.borrow() {
+                        break;
+                    }
+                }
+                changed = session_shutdown.changed() => {
+                    if changed.is_err() || *session_shutdown.borrow() {
                         break;
                     }
                 }
@@ -551,7 +568,7 @@ async fn spawn_local_forward(
             }
         }
     });
-    Ok(())
+    Ok(handle)
 }
 
 /// Try the configured auth method.

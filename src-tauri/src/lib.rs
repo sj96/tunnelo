@@ -5,13 +5,10 @@ mod commands;
 mod elevation;
 mod host_keys;
 mod hosts;
-mod http_router;
 mod local_router;
 mod model;
 mod platform;
 mod secrets;
-mod sni_proxy;
-mod sni_tls;
 mod store;
 mod tunnel;
 
