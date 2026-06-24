@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "pnpm dev:web",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "pnpm build:web",
     "frontendDist": "../dist"
   },
   "app": {
@@ -17,7 +17,8 @@
         "width": 920,
         "height": 600,
         "minWidth": 640,
-        "minHeight": 420
+        "minHeight": 420,
+        "visible": false
       }
     ],
     "security": {

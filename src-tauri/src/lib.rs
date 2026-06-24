@@ -42,6 +42,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .setup(|app| {
             let data_dir = app
                 .path()
@@ -73,6 +74,11 @@ pub fn run() {
         .on_window_event(|window, event| {
             // Closing hides to tray so tunnels keep running in the background.
             if let WindowEvent::CloseRequested { api, .. } = event {
+                #[cfg(desktop)]
+                {
+                    use tauri_plugin_window_state::{AppHandleExt, StateFlags};
+                    let _ = window.app_handle().save_window_state(StateFlags::all());
+                }
                 let _ = window.hide();
                 api.prevent_close();
             }
@@ -112,6 +118,11 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
             "quit" => {
                 if let Some(state) = app.try_state::<AppState>() {
                     state.local_router.shutdown_all();
+                }
+                #[cfg(desktop)]
+                {
+                    use tauri_plugin_window_state::{AppHandleExt, StateFlags};
+                    let _ = app.save_window_state(StateFlags::all());
                 }
                 app.exit(0);
             }
