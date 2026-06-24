@@ -15,13 +15,17 @@ mod sni_tls;
 mod store;
 mod tunnel;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use local_router::LocalRouter;
 use store::ProfileStore;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
-use tauri::{Manager, WindowEvent};
+use tauri::{Manager, RunEvent, WindowEvent};
 use tunnel::TunnelManager;
+
+/// Set when the user explicitly quits so close/exit handlers allow termination.
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
 /// Shared application state available to all Tauri commands.
 pub struct AppState {
@@ -72,15 +76,11 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Closing hides to tray so tunnels keep running in the background.
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                #[cfg(desktop)]
-                {
-                    use tauri_plugin_window_state::{AppHandleExt, StateFlags};
-                    let _ = window.app_handle().save_window_state(StateFlags::all());
+            if let WindowEvent::CloseRequested { .. } = event {
+                if SHUTTING_DOWN.load(Ordering::SeqCst) {
+                    return;
                 }
-                let _ = window.hide();
-                api.prevent_close();
+                shutdown_app(window.app_handle());
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -98,8 +98,46 @@ pub fn run() {
             commands::forget_host_key,
             commands::default_ssh_key_path,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            if let RunEvent::ExitRequested { api, code, .. } = event {
+                // Only allow exit after an explicit shutdown (X button or tray Quit).
+                if code.is_none() && !SHUTTING_DOWN.load(Ordering::SeqCst) {
+                    api.prevent_exit();
+                }
+            }
+        });
+}
+
+/// Tear down background work and terminate the process.
+///
+/// Must not block the UI thread: `CloseRequested` and tray Quit run on the main
+/// loop. Cleanup runs on a background thread; the process exits immediately.
+fn shutdown_app(app: &tauri::AppHandle) {
+    if SHUTTING_DOWN.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+
+    let app_bg = app.clone();
+    std::thread::spawn(move || {
+        if let Some(state) = app_bg.try_state::<AppState>() {
+            state.tunnels.stop_all();
+            state.local_router.shutdown_all();
+        }
+
+        #[cfg(desktop)]
+        {
+            use tauri_plugin_window_state::{AppHandleExt, StateFlags};
+            let _ = app_bg.save_window_state(StateFlags::all());
+        }
+    });
+
+    app.exit(0);
 }
 
 /// Build the system tray icon with a Show / Quit menu.
@@ -115,17 +153,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => show_main_window(app),
-            "quit" => {
-                if let Some(state) = app.try_state::<AppState>() {
-                    state.local_router.shutdown_all();
-                }
-                #[cfg(desktop)]
-                {
-                    use tauri_plugin_window_state::{AppHandleExt, StateFlags};
-                    let _ = app.save_window_state(StateFlags::all());
-                }
-                app.exit(0);
-            }
+            "quit" => shutdown_app(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {

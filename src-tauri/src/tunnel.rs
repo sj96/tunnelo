@@ -79,6 +79,16 @@ impl TunnelManager {
         Ok(())
     }
 
+    /// Stop every running tunnel (app quit).
+    pub fn stop_all(&self) {
+        let tunnels: Vec<RunningTunnel> = self.running.lock().drain().map(|(_, rt)| rt).collect();
+        self.resolved_bastion.lock().clear();
+        for rt in tunnels {
+            let _ = rt.shutdown.send(true);
+            rt.task.abort();
+        }
+    }
+
     /// Signal a tunnel to shut down. The task emits `Stopped` when it unwinds.
     pub fn stop(&self, id: &str) -> Result<(), String> {
         let Some(rt) = self.running.lock().remove(id) else {

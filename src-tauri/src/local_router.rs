@@ -234,7 +234,9 @@ impl LocalRouter {
         for (_, mut router) in state.http_routers.drain() {
             router.stop();
         }
-        let _ = state.sync_hosts_locked();
+        // Skip hosts sync on quit — `elevation::write_hosts_file` can block for
+        // seconds (UAC / PowerShell) and freezes the window. Orphans are removed
+        // on the next launch via `bootstrap()`.
     }
 }
 
