@@ -200,12 +200,12 @@ export function TunnelForm({ initial, onSave, onCancel, standalone = false }: Pr
               <input
                 className="form-row-input"
                 value={p.ssh.host}
-                placeholder="192.168.1.11 hoặc 192.168.1.*"
+                placeholder="192.168.1.11 or 192.168.1.*"
                 onChange={(e) => setSsh({ host: e.target.value })}
               />
             </label>
             <p className="form-footnote">
-              Pattern <code>*</code> sẽ tự quét subnet để tìm bastion SSH.
+              Pattern <code>*</code> will scan the subnet to find the bastion SSH.
             </p>
             <label className="form-row">
               <span className="form-row-label">Port</span>

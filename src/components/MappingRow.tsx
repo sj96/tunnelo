@@ -78,9 +78,18 @@ export function MappingRow({ index, mapping, canRemove, onChange, onRemove }: Pr
           type="button"
           className="icon-btn mapping-remove"
           title="Remove forward"
+          aria-label={`Remove forward #${index + 1}`}
           onClick={onRemove}
         >
-          ×
+          <svg aria-hidden="true" className="mapping-remove-icon" width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <path
+              d="M2.5 4h11M5.5 4V3a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v1M6.25 7v4.25M9.75 7v4.25M3.5 4l.65 8.35a1 1 0 0 0 1 .9h5.7a1 1 0 0 0 1-.9L12.5 4"
+              stroke="currentColor"
+              strokeWidth="1.25"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
         </button>
       )}
     </div>

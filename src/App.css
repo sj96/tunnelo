@@ -959,8 +959,8 @@ code {
 .ios-switch {
   position: relative;
   flex-shrink: 0;
-  width: 51px;
-  height: 31px;
+  width: 40px;
+  height: 24px;
 }
 
 .ios-switch input {
@@ -976,7 +976,7 @@ code {
   display: block;
   width: 100%;
   height: 100%;
-  border-radius: 16px;
+  border-radius: 12px;
   background: var(--bg-fill);
   transition: background var(--ease);
 }
@@ -985,17 +985,17 @@ code {
   position: absolute;
   top: 2px;
   left: 2px;
-  width: 27px;
-  height: 27px;
+  width: 20px;
+  height: 20px;
   border-radius: 50%;
   background: #fff;
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.25);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
   transition: transform var(--ease);
   pointer-events: none;
 }
 
 .ios-switch input:checked + .ios-switch-track { background: var(--system-green); }
-.ios-switch input:checked ~ .ios-switch-thumb { transform: translateX(20px); }
+.ios-switch input:checked ~ .ios-switch-thumb { transform: translateX(16px); }
 
 /* Mapping rows */
 .mapping-list { display: flex; flex-direction: column; }
@@ -1044,8 +1044,35 @@ code {
 .mapping-col input::placeholder { color: var(--label-tertiary); }
 
 .mapping-remove {
+  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
   margin-top: 2px;
+  color: var(--label-tertiary);
+  background: transparent;
+  transition: color var(--ease), background var(--ease);
+}
+
+.mapping-remove-icon {
+  display: block;
+}
+
+.mapping-row:hover .mapping-remove,
+.mapping-remove:focus-visible {
+  color: var(--label-secondary);
+}
+
+.mapping-remove:hover:not(:disabled) {
   color: var(--system-red);
+  background: rgba(255, 69, 58, 0.1);
+  opacity: 1;
+}
+
+.mapping-remove:focus-visible {
+  color: var(--system-red);
+  background: rgba(255, 69, 58, 0.08);
+  outline: 2px solid var(--system-red);
+  outline-offset: 2px;
 }
 
 .add-mapping {
