@@ -1,7 +1,7 @@
 //! Global local routing orchestrator — hosts, per-domain loopback IPs, SSH bind.
 
 use crate::hosts;
-use crate::model::ForwardMapping;
+use crate::model::{format_remote_url, ForwardMapping};
 use anyhow::{bail, Context, Result};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -92,7 +92,11 @@ impl LocalRouter {
             }
 
             if is_ip_address(remote_host) {
-                let access_url = format_access_url("127.0.0.1", mapping.remote_port);
+                let access_url = format_remote_url(
+                    remote_host,
+                    mapping.remote_port,
+                    mapping.remote_scheme.as_deref(),
+                );
                 activated.push(ActivatedMapping {
                     mapping_id: mapping.id.clone(),
                     bind_host: "127.0.0.1".into(),
@@ -118,7 +122,11 @@ impl LocalRouter {
                 public_port,
             };
 
-            let access_url = format_access_url(&hostname, public_port);
+            let access_url = format_remote_url(
+                &hostname,
+                public_port,
+                mapping.remote_scheme.as_deref(),
+            );
 
             pending.push(TunnelRegistration { key });
             activated.push(ActivatedMapping {
@@ -139,7 +147,7 @@ impl LocalRouter {
             if !is_ip_address(&m.remote_host) {
                 tracing::info!(
                     "routing {} → {}:{}",
-                    format_access_url(&normalize_hostname(&m.remote_host), m.remote_port),
+                    m.access_url,
                     m.bind_host,
                     m.bind_port
                 );
@@ -309,14 +317,6 @@ fn normalize_hostname(raw: &str) -> String {
     s.trim_end_matches('.').to_ascii_lowercase()
 }
 
-fn format_access_url(host: &str, port: u16) -> String {
-    match port {
-        443 => format!("https://{host}"),
-        80 => format!("http://{host}"),
-        _ => format!("https://{host}:{port}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,4 +411,4 @@ mod tests {
         );
     }
 }
-
+

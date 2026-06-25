@@ -57,6 +57,9 @@ pub struct ForwardMapping {
     pub remote_host: String,
     #[serde(default = "default_remote_port")]
     pub remote_port: u16,
+    /// `http` / `https` for web URLs; absent for bare `host:port` (e.g. IP:5432).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_scheme: Option<String>,
     /// Legacy local bind — migrated on load, not persisted.
     #[serde(default, skip_serializing)]
     pub local_host: String,
@@ -77,25 +80,86 @@ impl ForwardMapping {
 
     /// Public URL the user opens once routing is active (same as remote identity).
     pub fn local_access_url(&self) -> String {
-        format_remote_url(&self.remote_host, self.remote_port)
+        format_remote_url(
+            &self.remote_host,
+            self.remote_port,
+            self.remote_scheme.as_deref(),
+        )
     }
 }
 
-pub fn format_remote_url(host: &str, port: u16) -> String {
+fn normalize_remote_host(raw: &str) -> String {
+    let mut s = raw.trim();
+    if let Some(rest) = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+    {
+        s = rest;
+    }
+    s = s.split('/').next().unwrap_or(s).trim();
+
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some((ip, after)) = rest.split_once(']') {
+            let host = format!("[{ip}]");
+            if after.strip_prefix(':').is_some_and(|port| {
+                !port.is_empty() && port.chars().all(|c| c.is_ascii_digit())
+            }) {
+                return host;
+            }
+            return host;
+        }
+    }
+
+    if let Some((host, port)) = s.rsplit_once(':') {
+        if !host.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+            return host.trim_end_matches('.').to_string();
+        }
+    }
+
+    s.trim_end_matches('.').to_string()
+}
+
+pub fn format_remote_url(host: &str, port: u16, remote_scheme: Option<&str>) -> String {
+    let host = normalize_remote_host(host);
     if host.is_empty() {
         return String::new();
     }
+
+    match remote_scheme {
+        Some("http") => {
+            if port == 80 {
+                format!("http://{host}")
+            } else {
+                format!("http://{host}:{port}")
+            }
+        }
+        Some("https") => {
+            if port == 443 {
+                format!("https://{host}")
+            } else {
+                format!("https://{host}:{port}")
+            }
+        }
+        _ => format!("{host}:{port}"),
+    }
+}
+
+fn infer_remote_scheme(host: &str, port: u16, existing: &Option<String>) -> Option<String> {
+    if let Some(s) = existing {
+        if s == "http" || s == "https" {
+            return Some(s.clone());
+        }
+    }
     if host.parse::<std::net::IpAddr>().is_ok() {
         return match port {
-            443 => "https://127.0.0.1".into(),
-            80 => "http://127.0.0.1".into(),
-            _ => format!("https://127.0.0.1:{port}"),
+            80 => Some("http".into()),
+            443 => Some("https".into()),
+            _ => None,
         };
     }
     match port {
-        443 => format!("https://{host}"),
-        80 => format!("http://{host}"),
-        _ => format!("https://{host}:{port}"),
+        80 => Some("http".into()),
+        _ => Some("https".into()),
     }
 }
 
@@ -156,12 +220,13 @@ impl TunnelProfile {
             };
             self.mappings.push(ForwardMapping {
                 id: ForwardMapping::new_id(),
-                remote_host,
+                remote_host: remote_host.clone(),
                 remote_port: if self.local_service.port != 0 {
                     self.local_service.port
                 } else {
                     default_remote_port()
                 },
+                remote_scheme: None,
                 local_host: String::new(),
                 local_port: 0,
                 public_host: String::new(),
@@ -195,6 +260,8 @@ impl TunnelProfile {
             if m.id.is_empty() {
                 m.id = ForwardMapping::new_id();
             }
+            m.remote_host = normalize_remote_host(&m.remote_host);
+            m.remote_scheme = infer_remote_scheme(&m.remote_host, m.remote_port, &m.remote_scheme);
             m.local_host.clear();
             m.local_port = 0;
         }
@@ -216,6 +283,81 @@ impl TunnelProfile {
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_remote_url_https_default_port() {
+        assert_eq!(
+            format_remote_url("hrm.mservice.com.vn", 443, Some("https")),
+            "https://hrm.mservice.com.vn"
+        );
+    }
+
+    #[test]
+    fn format_remote_url_http_default_port() {
+        assert_eq!(
+            format_remote_url("nexus.mservice.com.vn", 80, Some("http")),
+            "http://nexus.mservice.com.vn"
+        );
+    }
+
+    #[test]
+    fn format_remote_url_https_custom_port() {
+        assert_eq!(
+            format_remote_url("atlassiansuite.mservice.com.vn", 8443, Some("https")),
+            "https://atlassiansuite.mservice.com.vn:8443"
+        );
+    }
+
+    #[test]
+    fn format_remote_url_bare_ip_port() {
+        assert_eq!(
+            format_remote_url("172.16.54.37", 5432, None),
+            "172.16.54.37:5432"
+        );
+    }
+
+    #[test]
+    fn infer_remote_scheme_legacy_profiles() {
+        assert_eq!(
+            infer_remote_scheme("hrm.mservice.com.vn", 443, &None),
+            Some("https".into())
+        );
+        assert_eq!(
+            infer_remote_scheme("nexus.mservice.com.vn", 80, &None),
+            Some("http".into())
+        );
+        assert_eq!(
+            infer_remote_scheme("172.16.54.37", 5432, &None),
+            None
+        );
+        assert_eq!(
+            infer_remote_scheme("app.example.com", 8443, &None),
+            Some("https".into())
+        );
+    }
+
+    #[test]
+    fn round_trip_user_examples_via_format() {
+        let cases = [
+            ("hrm.mservice.com.vn", 443, Some("https"), "https://hrm.mservice.com.vn"),
+            ("nexus.mservice.com.vn", 80, Some("http"), "http://nexus.mservice.com.vn"),
+            (
+                "atlassiansuite.mservice.com.vn",
+                8443,
+                Some("https"),
+                "https://atlassiansuite.mservice.com.vn:8443",
+            ),
+            ("172.16.54.37", 5432, None, "172.16.54.37:5432"),
+        ];
+        for (host, port, scheme, expected) in cases {
+            assert_eq!(format_remote_url(host, port, scheme), expected);
+        }
+    }
 }
 
 /// Runtime status of a tunnel, surfaced to the UI via events.

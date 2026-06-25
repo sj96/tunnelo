@@ -62,6 +62,8 @@ pub fn run() {
 
             setup_tray(app)?;
 
+            show_main_window(app.handle());
+
             // Auto-start tunnels flagged for launch.
             let handle = app.handle().clone();
             let state = app.state::<AppState>();

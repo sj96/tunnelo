@@ -3,7 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import type { SshAuth, TunnelProfile } from "../types";
 import { emptyMapping } from "../types";
 import { isValidBastionHost } from "../bastionHost";
-import { MappingRow } from "./MappingRow";
+import { MappingRow, type MappingRowHandle } from "./MappingRow";
 import { api } from "../api";
 
 export interface SecretInput {
@@ -35,7 +35,7 @@ function validationIssues(p: TunnelProfile): string[] {
   for (let i = 0; i < p.mappings.length; i++) {
     const m = p.mappings[i];
     if (!m.remoteHost.trim() || m.remotePort <= 0) {
-      issues.push(`Forward #${i + 1} URL`);
+      issues.push(`Forward #${i + 1} target`);
     }
   }
   return issues;
@@ -50,6 +50,7 @@ export function TunnelForm({ initial, onSave, onCancel, standalone = false }: Pr
   const [showSecret, setShowSecret] = useState(false);
   const editing = !!initial.id;
   const nameRef = useRef<HTMLInputElement>(null);
+  const mappingRefs = useRef<(MappingRowHandle | null)[]>([]);
 
   useEffect(() => {
     nameRef.current?.focus();
@@ -137,8 +138,16 @@ export function TunnelForm({ initial, onSave, onCancel, standalone = false }: Pr
   }
 
   function handleSave() {
-    if (!valid) return;
-    const profile: TunnelProfile = { ...p };
+    let mappings = [...p.mappings];
+    for (let i = 0; i < mappingRefs.current.length; i++) {
+      const result = mappingRefs.current[i]?.commit();
+      if (result === false) return;
+      if (result) mappings[i] = { ...mappings[i], ...result };
+    }
+    const draft: TunnelProfile = { ...p, mappings };
+    if (validationIssues(draft).length > 0) return;
+
+    const profile: TunnelProfile = draft;
     const secrets: SecretInput[] = [];
     if (secret) {
       if (p.ssh.auth.type === "password") {
@@ -345,11 +354,16 @@ export function TunnelForm({ initial, onSave, onCancel, standalone = false }: Pr
             <h3 className="form-section-title">Port Forwards</h3>
             <span className="form-section-badge">{p.mappings.length}</span>
           </div>
-          <p className="form-footnote">Remote service URLs reachable from the bastion.</p>
+          <p className="form-footnote">
+            http/https URL hoặc IP:port — ví dụ: https://hrm.mservice.com.vn, 172.16.54.37:5432
+          </p>
           <div className="form-section-card">
             <div className="mapping-list">
               {p.mappings.map((m, i) => (
                 <MappingRow
+                  ref={(el) => {
+                    mappingRefs.current[i] = el;
+                  }}
                   key={m.id || `new-${i}`}
                   index={i}
                   mapping={m}
