@@ -57,7 +57,7 @@ pub struct ForwardMapping {
     pub remote_host: String,
     #[serde(default = "default_remote_port")]
     pub remote_port: u16,
-    /// `http` / `https` for web URLs; absent for bare `host:port` (e.g. IP:5432).
+    /// `http` / `https` / `tcp` for web or raw TCP targets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_scheme: Option<String>,
     /// Legacy local bind — migrated on load, not persisted.
@@ -78,12 +78,13 @@ impl ForwardMapping {
         Uuid::new_v4().to_string()
     }
 
-    /// Public URL the user opens once routing is active (same as remote identity).
+    /// Local endpoint the user connects to once routing is active.
     pub fn local_access_url(&self) -> String {
-        format_remote_url(
+        format_local_access_url(
             &self.remote_host,
             self.remote_port,
             self.remote_scheme.as_deref(),
+            "127.0.0.1",
         )
     }
 }
@@ -93,6 +94,7 @@ fn normalize_remote_host(raw: &str) -> String {
     if let Some(rest) = s
         .strip_prefix("https://")
         .or_else(|| s.strip_prefix("http://"))
+        .or_else(|| s.strip_prefix("tcp://"))
     {
         s = rest;
     }
@@ -125,7 +127,10 @@ pub fn format_remote_url(host: &str, port: u16, remote_scheme: Option<&str>) -> 
         return String::new();
     }
 
-    match remote_scheme {
+    let remote_scheme = effective_remote_scheme(&host, port, remote_scheme);
+
+    match remote_scheme.as_deref() {
+        Some("tcp") => format!("tcp://{host}:{port}"),
         Some("http") => {
             if port == 80 {
                 format!("http://{host}")
@@ -144,23 +149,54 @@ pub fn format_remote_url(host: &str, port: u16, remote_scheme: Option<&str>) -> 
     }
 }
 
+/// Local endpoint the user connects to once the tunnel is active.
+pub fn format_local_access_url(
+    host: &str,
+    port: u16,
+    remote_scheme: Option<&str>,
+    bind_host: &str,
+) -> String {
+    let host = normalize_remote_host(host);
+    if host.is_empty() {
+        return String::new();
+    }
+
+    let remote_scheme = effective_remote_scheme(&host, port, remote_scheme);
+
+    if remote_scheme.as_deref() == Some("tcp") || is_ip_address(&host) {
+        return format!("tcp://{bind_host}:{port}");
+    }
+
+    format_remote_url(&host, port, remote_scheme.as_deref())
+}
+
+fn effective_remote_scheme(host: &str, port: u16, remote_scheme: Option<&str>) -> Option<String> {
+    match remote_scheme {
+        Some(s) if s == "http" || s == "https" || s == "tcp" => Some(s.to_string()),
+        _ => {
+            if is_ip_address(host) && port != 80 && port != 443 {
+                Some("tcp".into())
+            } else {
+                Some("http".into())
+            }
+        }
+    }
+}
+
+fn is_ip_address(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>().is_ok()
+}
+
 fn infer_remote_scheme(host: &str, port: u16, existing: &Option<String>) -> Option<String> {
     if let Some(s) = existing {
-        if s == "http" || s == "https" {
+        if s == "http" || s == "https" || s == "tcp" {
             return Some(s.clone());
         }
     }
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return match port {
-            80 => Some("http".into()),
-            443 => Some("https".into()),
-            _ => None,
-        };
+    if is_ip_address(host) && port != 80 && port != 443 {
+        return Some("tcp".into());
     }
-    match port {
-        80 => Some("http".into()),
-        _ => Some("https".into()),
-    }
+    Some("http".into())
 }
 
 /// Legacy single-service fields kept only for migration on load.
@@ -290,6 +326,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn format_local_access_url_tcp_uses_loopback() {
+        assert_eq!(
+            format_local_access_url("172.16.54.37", 5432, Some("tcp"), "127.0.0.1"),
+            "tcp://127.0.0.1:5432"
+        );
+    }
+
+    #[test]
+    fn format_local_access_url_hostname_https_unchanged() {
+        assert_eq!(
+            format_local_access_url("hrm.mservice.com.vn", 443, Some("https"), "127.0.0.1"),
+            "https://hrm.mservice.com.vn"
+        );
+    }
+
+    #[test]
+    fn local_access_url_on_mapping_uses_loopback_for_ip() {
+        let m = ForwardMapping {
+            id: "m1".into(),
+            remote_host: "172.16.54.37".into(),
+            remote_port: 5432,
+            remote_scheme: Some("tcp".into()),
+            local_host: String::new(),
+            local_port: 0,
+            public_host: String::new(),
+            subdomain: String::new(),
+        };
+        assert_eq!(m.local_access_url(), "tcp://127.0.0.1:5432");
+    }
+
+    #[test]
     fn format_remote_url_https_default_port() {
         assert_eq!(
             format_remote_url("hrm.mservice.com.vn", 443, Some("https")),
@@ -317,7 +384,23 @@ mod tests {
     fn format_remote_url_bare_ip_port() {
         assert_eq!(
             format_remote_url("172.16.54.37", 5432, None),
-            "172.16.54.37:5432"
+            "tcp://172.16.54.37:5432"
+        );
+    }
+
+    #[test]
+    fn format_remote_url_tcp_explicit() {
+        assert_eq!(
+            format_remote_url("172.16.54.37", 5432, Some("tcp")),
+            "tcp://172.16.54.37:5432"
+        );
+    }
+
+    #[test]
+    fn infer_remote_scheme_ip_overrides_stale_https() {
+        assert_eq!(
+            infer_remote_scheme("172.16.54.37", 5432, &Some("https".into())),
+            Some("https".into())
         );
     }
 
@@ -325,7 +408,7 @@ mod tests {
     fn infer_remote_scheme_legacy_profiles() {
         assert_eq!(
             infer_remote_scheme("hrm.mservice.com.vn", 443, &None),
-            Some("https".into())
+            Some("http".into())
         );
         assert_eq!(
             infer_remote_scheme("nexus.mservice.com.vn", 80, &None),
@@ -333,11 +416,19 @@ mod tests {
         );
         assert_eq!(
             infer_remote_scheme("172.16.54.37", 5432, &None),
-            None
+            Some("tcp".into())
         );
         assert_eq!(
             infer_remote_scheme("app.example.com", 8443, &None),
-            Some("https".into())
+            Some("http".into())
+        );
+    }
+
+    #[test]
+    fn format_remote_url_hostname_without_scheme_defaults_http() {
+        assert_eq!(
+            format_remote_url("app.example.com", 443, None),
+            "http://app.example.com:443"
         );
     }
 
@@ -352,7 +443,8 @@ mod tests {
                 Some("https"),
                 "https://atlassiansuite.mservice.com.vn:8443",
             ),
-            ("172.16.54.37", 5432, None, "172.16.54.37:5432"),
+            ("172.16.54.37", 5432, None, "tcp://172.16.54.37:5432"),
+            ("172.16.54.37", 5432, Some("tcp"), "tcp://172.16.54.37:5432"),
         ];
         for (host, port, scheme, expected) in cases {
             assert_eq!(format_remote_url(host, port, scheme), expected);
@@ -399,4 +491,7 @@ pub struct TunnelState {
     /// Resolved bastion IP when `ssh.host` is a wildcard pattern.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_bastion_host: Option<String>,
+    /// Unix epoch ms when the next reconnect attempt starts (countdown UI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at_ms: Option<u64>,
 }

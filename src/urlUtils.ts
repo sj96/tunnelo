@@ -1,4 +1,4 @@
-export type RemoteScheme = "http" | "https" | null;
+export type RemoteScheme = "http" | "https" | "tcp" | null;
 
 export type ParsedTarget = { host: string; port: number; scheme: RemoteScheme };
 
@@ -10,6 +10,12 @@ export function parseRemoteTarget(raw: string): ParsedTarget | null {
   try {
     if (s.includes("://")) {
       const url = new URL(s);
+      if (url.protocol === "tcp:") {
+        if (!url.hostname || !url.port) return null;
+        const port = Number(url.port);
+        if (!Number.isInteger(port) || port <= 0) return null;
+        return { host: url.hostname, port, scheme: "tcp" };
+      }
       if (url.protocol !== "http:" && url.protocol !== "https:") return null;
       const scheme: RemoteScheme = url.protocol === "https:" ? "https" : "http";
       const port = url.port
@@ -25,11 +31,19 @@ export function parseRemoteTarget(raw: string): ParsedTarget | null {
     if (colon > 0 && !s.includes("/")) {
       const host = s.slice(0, colon);
       const port = Number(s.slice(colon + 1));
-      if (host && port > 0) return { host, port, scheme: null };
+      if (host && Number.isInteger(port) && port > 0) {
+        const scheme: RemoteScheme = isIpAddress(host) ? "tcp" : "http";
+        return { host, port, scheme };
+      }
     }
 
     const host = s.split("/")[0];
-    if (host) return { host, port: 443, scheme: "https" };
+    if (!host) return null;
+
+    // Bare IPv4 (or partial) without :port is invalid — avoids misclassifying as https.
+    if (isIpAddress(host) || /^\d+(\.\d+)*$/.test(host)) return null;
+
+    return { host, port: 80, scheme: "http" };
   } catch {
     return null;
   }
@@ -65,15 +79,42 @@ export function formatForwardInput(
   const h = normalizeRemoteHost(host);
   if (!h) return "";
 
+  if (scheme === "tcp") {
+    return `tcp://${h}:${port}`;
+  }
   if (scheme === "https") {
     if (port === 443) return `https://${h}`;
     return `https://${h}:${port}`;
   }
-  if (scheme === "http") {
+  if (scheme === "http" || scheme === null) {
     if (port === 80) return `http://${h}`;
     return `http://${h}:${port}`;
   }
   return `${h}:${port}`;
+}
+
+/** Local endpoint the user connects to once the tunnel is active. */
+export function formatLocalAccessUrl(
+  host: string,
+  port: number,
+  scheme: RemoteScheme = null,
+  bindHost = "127.0.0.1",
+): string {
+  const h = normalizeRemoteHost(host);
+  if (!h) return "";
+
+  if (scheme === "tcp" || isIpAddress(h)) {
+    return `tcp://${bindHost}:${port}`;
+  }
+  if (scheme === "https") {
+    if (port === 443) return `https://${h}`;
+    return `https://${h}:${port}`;
+  }
+  if (scheme === "http" || scheme === null) {
+    if (port === 80) return `http://${h}`;
+    return `http://${h}:${port}`;
+  }
+  return `${bindHost}:${port}`;
 }
 
 /** Display string for access once the tunnel is active. */
@@ -82,18 +123,7 @@ export function formatAccessUrl(
   port: number,
   scheme: RemoteScheme = null,
 ): string {
-  const h = normalizeRemoteHost(host);
-  if (!h) return "";
-
-  if (scheme === "https") {
-    if (port === 443) return `https://${h}`;
-    return `https://${h}:${port}`;
-  }
-  if (scheme === "http") {
-    if (port === 80) return `http://${h}`;
-    return `http://${h}:${port}`;
-  }
-  return `${h}:${port}`;
+  return formatLocalAccessUrl(host, port, scheme);
 }
 
 export function isWebForward(scheme: RemoteScheme | undefined): boolean {

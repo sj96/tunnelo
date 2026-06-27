@@ -36,6 +36,8 @@ function App() {
   const [tunnels, setTunnels] = useState<TunnelProfile[]>([]);
   const [statuses, setStatuses] = useState<Record<string, TunnelStatus>>({});
   const [resolvedBastions, setResolvedBastions] = useState<Record<string, string | null>>({});
+  const [localUrls, setLocalUrls] = useState<Record<string, string[]>>({});
+  const [retryAtMs, setRetryAtMs] = useState<Record<string, number | null>>({});
   const [busy, setBusy] = useState<Record<string, boolean>>({});
   const [editing, setEditing] = useState<TunnelProfile | null>(null);
   const [toast, setToast] = useState<{ msg: string; info?: boolean } | null>(null);
@@ -72,6 +74,20 @@ function App() {
       setStatuses((prev) => ({ ...prev, [s.id]: s.status }));
       if (s.resolvedBastionHost !== undefined) {
         setResolvedBastions((prev) => ({ ...prev, [s.id]: s.resolvedBastionHost ?? null }));
+      }
+      if (s.localUrls !== undefined) {
+        setLocalUrls((prev) => ({ ...prev, [s.id]: s.localUrls ?? [] }));
+      }
+      if (s.status === "stopped" || s.status === "error") {
+        setLocalUrls((prev) => {
+          const { [s.id]: _, ...rest } = prev;
+          return rest;
+        });
+      }
+      if (s.status === "reconnecting") {
+        setRetryAtMs((prev) => ({ ...prev, [s.id]: s.retryAtMs ?? null }));
+      } else {
+        setRetryAtMs((prev) => ({ ...prev, [s.id]: null }));
       }
       setBusy((b) => ({ ...b, [s.id]: false }));
       if (s.status === "error" && s.error) {
@@ -229,7 +245,9 @@ function App() {
                     key={t.id}
                     profile={t}
                     status={statuses[t.id] ?? "stopped"}
+                    localUrls={localUrls[t.id]}
                     resolvedBastionHost={resolvedBastions[t.id]}
+                    retryAtMs={retryAtMs[t.id]}
                     busy={!!busy[t.id]}
                     onStart={() => handleStart(t.id)}
                     onStop={() => handleStop(t.id)}

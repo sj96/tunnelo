@@ -7,7 +7,7 @@
 use crate::bastion_resolve;
 use crate::host_keys;
 use crate::local_router::ActivatedMapping;
-use crate::model::{SshAuth, TunnelProfile, TunnelState, TunnelStatus};
+use crate::model::{format_local_access_url, SshAuth, TunnelProfile, TunnelState, TunnelStatus};
 use crate::secrets;
 use crate::AppState;
 use anyhow::{bail, Context, Result};
@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::io::copy_bidirectional;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -108,7 +108,7 @@ impl TunnelManager {
 
 /// Notify the UI that a tunnel has stopped (also used when stop is invoked from IPC).
 pub fn emit_stopped(app: &AppHandle, id: &str) {
-    emit_state(app, id, TunnelStatus::Stopped, None, None, None);
+    emit_state(app, id, TunnelStatus::Stopped, None, None, None, None);
 }
 
 /// Minimal client handler — host key verification only.
@@ -142,6 +142,7 @@ impl client::Handler for ClientHandler {
                     None,
                     Some(format!("{e:#}")),
                     None,
+                    None,
                 );
                 Ok(false)
             }
@@ -166,8 +167,62 @@ fn is_shutdown(err: &anyhow::Error) -> bool {
         .any(|e| e.downcast_ref::<ShutdownRequested>().is_some())
 }
 
-/// Supervises one tunnel across (re)connections, applying auto-reconnect with
-/// exponential backoff. Emits status transitions to the UI.
+fn is_benign_forward_close(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+    ) || matches!(err.raw_os_error(), Some(10053) | Some(10054))
+}
+
+/// Relay bytes between local TCP and SSH channel; shutdown write-half when one side EOFs.
+async fn relay_forward(
+    socket: &mut TcpStream,
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+) -> std::io::Result<()> {
+    let (mut cr, mut cw) = socket.split();
+    let (mut sr, mut sw) = tokio::io::split(stream);
+    tokio::select! {
+        r = tokio::io::copy(&mut cr, &mut sw) => {
+            r?;
+            let _ = sw.shutdown().await;
+        }
+        r = tokio::io::copy(&mut sr, &mut cw) => {
+            r?;
+            let _ = cw.shutdown().await;
+        }
+    }
+    Ok(())
+}
+
+fn log_forward_close(app: &AppHandle, id: &str, e: std::io::Error) {
+    if is_benign_forward_close(&e) {
+        tracing::debug!(tunnel_id = %id, "Forward closed: {e}");
+    } else {
+        emit_log(
+            app,
+            id,
+            LogLevel::Warn,
+            &format!("Forward closed: {e}"),
+        );
+    }
+}
+
+const RETRY_DELAY_SECS: u64 = 5;
+/// Max wait for bastion to open the SSH direct-tcpip channel to the remote target.
+const REMOTE_FORWARD_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Supervises one tunnel across (re)connections with fixed-delay retry on
+/// failed reconnect attempts. Emits status transitions to the UI.
 async fn supervise(app: &AppHandle, profile: &TunnelProfile, mut shutdown: watch::Receiver<bool>) {
     let id = &profile.id;
     let state = app.state::<AppState>();
@@ -191,12 +246,12 @@ async fn supervise(app: &AppHandle, profile: &TunnelProfile, mut shutdown: watch
                 None,
                 Some(format!("{e:#}")),
                 None,
+                None,
             );
             return;
         }
     };
 
-    let mut backoff = 2u64;
     let mut reconnecting = false;
     loop {
         if *shutdown.borrow() {
@@ -213,6 +268,7 @@ async fn supervise(app: &AppHandle, profile: &TunnelProfile, mut shutdown: watch
             None,
             None,
             None,
+            None,
         );
 
         match run_tunnel(app, profile, &bindings, &mut shutdown).await {
@@ -221,23 +277,34 @@ async fn supervise(app: &AppHandle, profile: &TunnelProfile, mut shutdown: watch
                 if !profile.auto_reconnect || *shutdown.borrow() {
                     break;
                 }
-                emit_log(
+                emit_log(app, id, LogLevel::Warn, "Connection lost — reconnecting");
+                emit_state(
                     app,
                     id,
-                    LogLevel::Warn,
-                    &format!("Connection lost — reconnecting in {backoff}s"),
+                    TunnelStatus::Reconnecting,
+                    None,
+                    None,
+                    None,
+                    None,
                 );
-                emit_state(app, id, TunnelStatus::Reconnecting, None, None, None);
                 reconnecting = true;
-                if wait_or_shutdown(&mut shutdown, Duration::from_secs(backoff)).await {
-                    break;
-                }
-                backoff = (backoff * 2).min(30);
                 continue;
             }
             Err(e) => {
                 if *shutdown.borrow() {
                     break;
+                }
+                if reconnecting {
+                    emit_log(
+                        app,
+                        id,
+                        LogLevel::Warn,
+                        &format!("Reconnect failed: {e:#}"),
+                    );
+                    if wait_retry(app, id, &mut shutdown, RETRY_DELAY_SECS).await {
+                        break;
+                    }
+                    continue;
                 }
                 emit_log(app, id, LogLevel::Error, &format!("Error: {e:#}"));
                 emit_state(
@@ -247,12 +314,33 @@ async fn supervise(app: &AppHandle, profile: &TunnelProfile, mut shutdown: watch
                     None,
                     Some(format!("{e:#}")),
                     None,
+                    None,
                 );
                 return;
             }
         }
     }
-    emit_state(app, id, TunnelStatus::Stopped, None, None, None);
+    emit_state(app, id, TunnelStatus::Stopped, None, None, None, None);
+}
+
+/// Emit reconnecting state with countdown, wait, return true if shutdown requested.
+async fn wait_retry(
+    app: &AppHandle,
+    id: &str,
+    shutdown: &mut watch::Receiver<bool>,
+    secs: u64,
+) -> bool {
+    let retry_at = now_ms() + secs * 1000;
+    emit_state(
+        app,
+        id,
+        TunnelStatus::Reconnecting,
+        None,
+        None,
+        None,
+        Some(retry_at),
+    );
+    wait_or_shutdown(shutdown, Duration::from_secs(secs)).await
 }
 
 /// Wait up to `duration`, returning true if shutdown was requested.
@@ -289,35 +377,61 @@ async fn run_tunnel(
 
     let (forward_shutdown, forward_shutdown_rx) = watch::channel(false);
     let mut forward_tasks = Vec::with_capacity(bindings.len());
+    let mut local_urls = Vec::with_capacity(bindings.len());
 
     for mapping in bindings {
-        forward_tasks.push(
-            spawn_local_forward(
-                app,
-                id.clone(),
-                session.clone(),
-                shutdown.clone(),
-                forward_shutdown_rx.clone(),
-                mapping.bind_host.clone(),
-                mapping.bind_port,
-                mapping.remote_host.clone(),
-                mapping.remote_port,
+        let allow_port_fallback = mapping.remote_host.parse::<std::net::IpAddr>().is_ok();
+        let (task, bind_port) = spawn_local_forward(
+            app,
+            id.clone(),
+            session.clone(),
+            shutdown.clone(),
+            forward_shutdown_rx.clone(),
+            mapping.bind_host.clone(),
+            mapping.bind_port,
+            mapping.remote_host.clone(),
+            mapping.remote_port,
+            allow_port_fallback,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "binding local {}:{}",
+                mapping.bind_host, mapping.bind_port
             )
-            .await
-            .with_context(|| {
-                format!(
-                    "binding local {}:{}",
-                    mapping.bind_host, mapping.bind_port
-                )
-            })?,
-        );
+        })?;
+
+        if bind_port != mapping.bind_port {
+            emit_log(
+                app,
+                id,
+                LogLevel::Warn,
+                &format!(
+                    "Port {} in use locally — using {}:{} instead (connect to this address)",
+                    mapping.bind_port, mapping.bind_host, bind_port
+                ),
+            );
+        }
+
+        local_urls.push(if bind_port == mapping.bind_port {
+            mapping.access_url.clone()
+        } else {
+            format_local_access_url(
+                &mapping.remote_host,
+                bind_port,
+                None,
+                &mapping.bind_host,
+            )
+        });
+
+        forward_tasks.push(task);
         emit_log(
             app,
             id,
             LogLevel::Forward,
             &format!(
-                "127.0.0.1:{} → {}:{}",
-                mapping.bind_port, mapping.remote_host, mapping.remote_port
+                "{}:{} → {}:{}",
+                mapping.bind_host, bind_port, mapping.remote_host, mapping.remote_port
             ),
         );
     }
@@ -336,7 +450,7 @@ async fn run_tunnel(
     } else {
         None
     };
-    let urls: Vec<String> = bindings.iter().map(|m| m.access_url.clone()).collect();
+    let urls = local_urls;
     emit_state(
         app,
         id,
@@ -344,6 +458,7 @@ async fn run_tunnel(
         Some(urls),
         None,
         resolved_bastion,
+        None,
     );
 
     let mut tick = tokio::time::interval(Duration::from_secs(5));
@@ -504,6 +619,7 @@ async fn connect_session_inner(
 
 /// Bind a local port; tunnel each accepted connection to `remote_host:remote_port`
 /// via `channel_open_direct_tcpip` on the SSH session.
+/// Returns the listener task and the actual bound port (may differ when `allow_port_fallback`).
 async fn spawn_local_forward(
     app: &AppHandle,
     id: String,
@@ -514,10 +630,10 @@ async fn spawn_local_forward(
     local_port: u16,
     remote_host: String,
     remote_port: u16,
-) -> Result<JoinHandle<()>> {
-    let listener = TcpListener::bind((local_host.as_str(), local_port))
-        .await
-        .with_context(|| format!("binding {local_host}:{local_port}"))?;
+    allow_port_fallback: bool,
+) -> Result<(JoinHandle<()>, u16)> {
+    let (listener, bind_port) =
+        bind_local_listener(&local_host, local_port, allow_port_fallback).await?;
     let app = app.clone();
     let handle = tokio::spawn(async move {
         loop {
@@ -533,42 +649,92 @@ async fn spawn_local_forward(
                     }
                 }
                 accept = listener.accept() => {
-                    let Ok((mut socket, _)) = accept else { break };
+                    let Ok((mut socket, peer)) = accept else { break };
+                    let _ = socket.set_nodelay(true);
                     let session = session.clone();
                     let rh = remote_host.clone();
                     let rp = remote_port;
                     let app = app.clone();
                     let id = id.clone();
+                    let origin_host = peer.ip().to_string();
+                    let origin_port = peer.port();
                     tokio::spawn(async move {
-                        match session
-                            .channel_open_direct_tcpip(&rh, rp as u32, "127.0.0.1", 0)
-                            .await
-                        {
-                            Ok(channel) => {
+                        let open = tokio::time::timeout(
+                            REMOTE_FORWARD_TIMEOUT,
+                            session.channel_open_direct_tcpip(
+                                &rh,
+                                rp as u32,
+                                &origin_host,
+                                origin_port as u32,
+                            ),
+                        )
+                        .await;
+                        match open {
+                            Ok(Ok(channel)) => {
                                 let mut stream = channel.into_stream();
-                                if let Err(e) = copy_bidirectional(&mut socket, &mut stream).await
-                                {
-                                    emit_log(
-                                        &app,
-                                        &id,
-                                        LogLevel::Warn,
-                                        &format!("Forward closed: {e}"),
-                                    );
+                                if let Err(e) = relay_forward(&mut socket, &mut stream).await {
+                                    log_forward_close(&app, &id, e);
                                 }
                             }
-                            Err(e) => emit_log(
-                                &app,
-                                &id,
-                                LogLevel::Error,
-                                &format!("Cannot reach {rh}:{rp} via bastion — {e}"),
-                            ),
+                            Ok(Err(e)) => {
+                                emit_log(
+                                    &app,
+                                    &id,
+                                    LogLevel::Error,
+                                    &format!("Cannot reach {rh}:{rp} via bastion — {e}"),
+                                );
+                                let _ = socket.shutdown().await;
+                            }
+                            Err(_) => {
+                                emit_log(
+                                    &app,
+                                    &id,
+                                    LogLevel::Error,
+                                    &format!(
+                                        "Timed out connecting to {rh}:{rp} via bastion — check routing/firewall from bastion"
+                                    ),
+                                );
+                                let _ = socket.shutdown().await;
+                            }
                         }
                     });
                 }
             }
         }
     });
-    Ok(handle)
+    Ok((handle, bind_port))
+}
+
+/// Bind `local_host:preferred_port`, falling back to an ephemeral port for IP/TCP forwards.
+async fn bind_local_listener(
+    local_host: &str,
+    preferred_port: u16,
+    allow_port_fallback: bool,
+) -> Result<(TcpListener, u16)> {
+    match TcpListener::bind((local_host, preferred_port)).await {
+        Ok(listener) => {
+            let port = if preferred_port == 0 {
+                listener
+                    .local_addr()
+                    .context("reading bind port")?
+                    .port()
+            } else {
+                preferred_port
+            };
+            Ok((listener, port))
+        }
+        Err(e) if allow_port_fallback && e.kind() == std::io::ErrorKind::AddrInUse => {
+            let listener = TcpListener::bind((local_host, 0))
+                .await
+                .with_context(|| format!("binding ephemeral port on {local_host}"))?;
+            let port = listener
+                .local_addr()
+                .context("reading ephemeral bind port")?
+                .port();
+            Ok((listener, port))
+        }
+        Err(e) => Err(e).with_context(|| format!("binding {local_host}:{preferred_port}")),
+    }
 }
 
 /// Try the configured auth method.
@@ -681,6 +847,7 @@ fn emit_state(
     local_urls: Option<Vec<String>>,
     error: Option<String>,
     resolved_bastion_host: Option<String>,
+    retry_at_ms: Option<u64>,
 ) {
     let local_url = local_urls.as_ref().and_then(|u| u.first().cloned());
     let _ = app.emit(
@@ -694,6 +861,7 @@ fn emit_state(
             public_url: local_url,
             error,
             resolved_bastion_host,
+            retry_at_ms,
         },
     );
 }
@@ -720,4 +888,96 @@ fn emit_log(app: &AppHandle, id: &str, level: LogLevel, message: &str) {
         "tunnel://log",
         serde_json::json!({ "id": id, "level": level, "message": message, "ts": ts }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bind_local_listener_uses_preferred_port_when_free() {
+        let probe = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("probe bind");
+        let free_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let (listener, port) = bind_local_listener("127.0.0.1", free_port, false)
+            .await
+            .expect("bind preferred");
+        assert_eq!(port, free_port);
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn bind_local_listener_falls_back_when_port_in_use() {
+        let blocker = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("blocker bind");
+        let blocked_port = blocker.local_addr().unwrap().port();
+
+        let (listener, port) = bind_local_listener("127.0.0.1", blocked_port, true)
+            .await
+            .expect("fallback bind");
+        assert_ne!(port, blocked_port);
+        drop(listener);
+        drop(blocker);
+    }
+
+    #[test]
+    fn is_benign_forward_close_detects_expected_kinds() {
+        use std::io::{Error, ErrorKind};
+
+        assert!(is_benign_forward_close(&Error::from(
+            ErrorKind::ConnectionReset,
+        )));
+        assert!(is_benign_forward_close(&Error::from(
+            ErrorKind::ConnectionAborted,
+        )));
+        assert!(is_benign_forward_close(&Error::new(
+            ErrorKind::ConnectionAborted,
+            "aborted",
+        )));
+        assert!(is_benign_forward_close(&Error::from(
+            ErrorKind::BrokenPipe,
+        )));
+        assert!(is_benign_forward_close(&Error::from(
+            ErrorKind::UnexpectedEof,
+        )));
+        assert!(!is_benign_forward_close(&Error::new(
+            ErrorKind::TimedOut,
+            "timeout",
+        )));
+        assert!(!is_benign_forward_close(&Error::from(
+            ErrorKind::TimedOut,
+        )));
+        assert!(!is_benign_forward_close(&Error::from(
+            ErrorKind::AddrInUse,
+        )));
+        assert!(!is_benign_forward_close(&Error::new(
+            ErrorKind::AddrInUse,
+            "addr in use",
+        )));
+    }
+
+    #[test]
+    fn is_benign_forward_close_detects_windows_wsa_codes() {
+        assert!(is_benign_forward_close(&std::io::Error::from_raw_os_error(10053)));
+        assert!(is_benign_forward_close(&std::io::Error::from_raw_os_error(10054)));
+        assert!(!is_benign_forward_close(&std::io::Error::from_raw_os_error(995)));
+    }
+
+    #[tokio::test]
+    async fn bind_local_listener_errors_when_port_in_use_and_no_fallback() {
+        let blocker = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("blocker bind");
+        let blocked_port = blocker.local_addr().unwrap().port();
+
+        let err = bind_local_listener("127.0.0.1", blocked_port, false)
+            .await
+            .expect_err("should fail without fallback");
+        assert!(format!("{err:#}").contains(&blocked_port.to_string()));
+        drop(blocker);
+    }
 }

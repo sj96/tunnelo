@@ -1,7 +1,7 @@
 //! Global local routing orchestrator — hosts, per-domain loopback IPs, SSH bind.
 
 use crate::hosts;
-use crate::model::{format_remote_url, ForwardMapping};
+use crate::model::{format_local_access_url, format_remote_url, ForwardMapping};
 use anyhow::{bail, Context, Result};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -83,7 +83,7 @@ impl LocalRouter {
         let mut pending: Vec<TunnelRegistration> = Vec::new();
 
         for mapping in mappings {
-            let remote_host = mapping.remote_host.trim();
+            let remote_host = normalize_hostname(&mapping.remote_host);
             if remote_host.is_empty() {
                 bail!("each mapping needs a remote target host");
             }
@@ -91,24 +91,25 @@ impl LocalRouter {
                 bail!("each mapping needs a valid remote port");
             }
 
-            if is_ip_address(remote_host) {
-                let access_url = format_remote_url(
-                    remote_host,
+            if is_ip_address(&remote_host) {
+                let access_url = format_local_access_url(
+                    &remote_host,
                     mapping.remote_port,
                     mapping.remote_scheme.as_deref(),
+                    "127.0.0.1",
                 );
                 activated.push(ActivatedMapping {
                     mapping_id: mapping.id.clone(),
                     bind_host: "127.0.0.1".into(),
                     bind_port: mapping.remote_port,
-                    remote_host: remote_host.to_string(),
+                    remote_host: remote_host.clone(),
                     remote_port: mapping.remote_port,
                     access_url,
                 });
                 continue;
             }
 
-            let hostname = normalize_hostname(remote_host);
+            let hostname = remote_host;
             let public_port = mapping.remote_port;
             let loopback_ip = reserve_domain_route(
                 &mut routes,
@@ -291,6 +292,7 @@ fn normalize_hostname(raw: &str) -> String {
     if let Some(rest) = s
         .strip_prefix("https://")
         .or_else(|| s.strip_prefix("http://"))
+        .or_else(|| s.strip_prefix("tcp://"))
     {
         s = rest;
     }
@@ -320,6 +322,51 @@ fn normalize_hostname(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ip_forward_binds_loopback_and_preserves_access_url() {
+        use crate::model::ForwardMapping;
+
+        let router = LocalRouter::new();
+        let mapping = ForwardMapping {
+            id: "m1".into(),
+            remote_host: "172.16.54.37:5432".into(),
+            remote_port: 5432,
+            remote_scheme: None,
+            local_host: String::new(),
+            local_port: 0,
+            public_host: String::new(),
+            subdomain: String::new(),
+        };
+        let activated = router.activate_tunnel("t1", &[mapping]).unwrap();
+        assert_eq!(activated.len(), 1);
+        assert_eq!(activated[0].bind_host, "127.0.0.1");
+        assert_eq!(activated[0].bind_port, 5432);
+        assert_eq!(activated[0].remote_host, "172.16.54.37");
+        assert_eq!(activated[0].access_url, "tcp://127.0.0.1:5432");
+        router.deactivate_tunnel("t1");
+    }
+
+    #[test]
+    fn hostname_forward_without_scheme_uses_http_access_url() {
+        use crate::model::ForwardMapping;
+
+        let router = LocalRouter::new();
+        let mapping = ForwardMapping {
+            id: "m2".into(),
+            remote_host: "app.example.com:443".into(),
+            remote_port: 443,
+            remote_scheme: None,
+            local_host: String::new(),
+            local_port: 0,
+            public_host: String::new(),
+            subdomain: String::new(),
+        };
+        let activated = router.activate_tunnel("t2", &[mapping]).unwrap();
+        assert_eq!(activated.len(), 1);
+        assert_eq!(activated[0].access_url, "http://app.example.com:443");
+        router.deactivate_tunnel("t2");
+    }
 
     #[test]
     fn normalize_hostname_strips_scheme_port_and_trailing_dot() {

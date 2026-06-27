@@ -24,7 +24,7 @@ const AUTH_LABELS: Record<SshAuth["type"], string> = {
   password: "Password",
 };
 
-function validationIssues(p: TunnelProfile): string[] {
+function validationIssues(p: TunnelProfile, opts?: { skipForwards?: boolean }): string[] {
   const issues: string[] = [];
   if (!p.name.trim()) issues.push("Name");
   if (!p.ssh.host.trim()) issues.push("Bastion host");
@@ -32,10 +32,12 @@ function validationIssues(p: TunnelProfile): string[] {
   if (!p.ssh.user.trim()) issues.push("SSH user");
   if (p.ssh.auth.type === "key" && !p.ssh.auth.keyPath.trim()) issues.push("Key path");
   if (p.mappings.length === 0) issues.push("At least one forward");
-  for (let i = 0; i < p.mappings.length; i++) {
-    const m = p.mappings[i];
-    if (!m.remoteHost.trim() || m.remotePort <= 0) {
-      issues.push(`Forward #${i + 1} target`);
+  if (!opts?.skipForwards) {
+    for (let i = 0; i < p.mappings.length; i++) {
+      const m = p.mappings[i];
+      if (!m.remoteHost.trim() || m.remotePort <= 0) {
+        issues.push(`Forward #${i + 1} target`);
+      }
     }
   }
   return issues;
@@ -112,6 +114,7 @@ export function TunnelForm({ initial, onSave, onCancel, standalone = false }: Pr
   };
 
   const issues = useMemo(() => validationIssues(p), [p]);
+  const saveBlockingIssues = useMemo(() => validationIssues(p, { skipForwards: true }), [p]);
   const valid = issues.length === 0;
 
   async function browseKeyPath() {
@@ -355,7 +358,7 @@ export function TunnelForm({ initial, onSave, onCancel, standalone = false }: Pr
             <span className="form-section-badge">{p.mappings.length}</span>
           </div>
           <p className="form-footnote">
-            http/https URL hoặc IP:port — ví dụ: https://hrm.mservice.com.vn, 172.16.54.37:5432
+            http/https URL, tcp://host:port, hoặc IP:port — ví dụ: https://hrm.mservice.com.vn, tcp://172.16.54.37:5432
           </p>
           <div className="form-section-card">
             <div className="mapping-list">
@@ -426,7 +429,12 @@ export function TunnelForm({ initial, onSave, onCancel, standalone = false }: Pr
           <button type="button" className="btn ghost" onClick={onCancel}>
             Cancel
           </button>
-          <button type="button" className="btn primary" disabled={!valid} onClick={handleSave}>
+          <button
+            type="button"
+            className="btn primary"
+            disabled={saveBlockingIssues.length > 0}
+            onClick={handleSave}
+          >
             Save
           </button>
         </div>

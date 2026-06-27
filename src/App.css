@@ -404,6 +404,11 @@ code {
 .status-pill.reconnecting { color: var(--system-orange); background: rgba(255, 159, 10, 0.15); }
 .status-pill.error { color: var(--system-red); background: rgba(255, 69, 58, 0.15); }
 
+.retry-countdown {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
 .port-tag { opacity: 0.75; }
 
 .forward-chip {
