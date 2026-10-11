@@ -9,7 +9,8 @@
     "build:web": "tsc && vite build",
     "test": "npx -y vitest@3 run",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "build": "tauri build"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
