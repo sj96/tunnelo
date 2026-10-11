@@ -16,8 +16,8 @@ App quét các IP trong pattern, tìm máy có **cổng SSH mở** (`ssh.port`, 
 1. `is_wildcard_host` — pattern có đúng 4 octet và ít nhất một `*`.
 2. `expand_wildcard` — sinh danh sách `Ipv4Addr` (`*` = 1–254, không gồm .0/.255).
 3. `scan_ssh_port` — TCP connect song song (32 concurrent, timeout 500ms), trả IP đầu tiên OK.
-4. Cache IP resolved per tunnel id; reconnect dùng cache.
-5. Connect fail với cache → **rescan** (log `"Cached X unreachable — rescanning"`).
+4. Cache IP resolved per tunnel id; reconnect/retry dùng cache, **không scan lại**.
+5. Muốn scan lại → stop tunnel rồi connect lại.
 
 Host key TOFU lưu theo **IP resolved**, không theo pattern. **Forget host key** cũng xóa key của IP resolved (nếu có).
 

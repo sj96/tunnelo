@@ -4,10 +4,11 @@
 
 App **tự ghi** `C:\Windows\System32\drivers\etc\hosts` (Windows) khi tunnel chạy — user **không cần sửa tay**.
 
-Mỗi hostname trong mapping (không phải IP) được thêm:
+Mỗi hostname trong mapping, gồm cả IP đích, được thêm bằng hostname nội bộ:
 
 ```
 127.0.0.1 gitlab.example.com # tunnelo-managed
+127.0.0.2 172.16.54.37.tunnel # tunnelo-managed
 ```
 
 Khi stop tunnel / quit app → dòng có marker được gỡ (nếu không còn tunnel nào dùng hostname đó).
@@ -53,4 +54,4 @@ User hủy UAC → tunnel có thể lỗi routing setup.
 - **UAC** — lần đầu hoặc khi không đủ quyền, Windows hiện prompt; cần Accept.
 - **WOW64** — app 32-bit đọc/ghi đúng `System32\drivers\etc\hosts` qua `Sysnative`.
 - **Không sửa marker tay** — app có thể ghi đè hoặc xóa dòng managed khi sync.
-- **IP remoteHost** — không thêm hosts (truy cập qua `127.0.0.1` trực tiếp).
+- **IP remoteHost** — được đổi thành `{ip}.tunnel` để dùng chung cơ chế router.

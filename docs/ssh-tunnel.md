@@ -42,7 +42,7 @@ ssh -L <local>:<remoteHost>:<remotePort> ... user@bastion
 | `remoteHost` | Bind local | Access URL |
 |---|---|---|
 | Hostname (vd. `gitlab.example.com`) | Port pool 49100–49999 + router | `https://hostname` |
-| IP (vd. `10.0.1.5`) | Trực tiếp `127.0.0.1:remotePort` | `https://127.0.0.1` |
+| IPv4 (vd. `10.0.1.5`) | Hostname `{ip}.tunnel` + router | `tcp://10.0.1.5.tunnel:remotePort` |
 
 ## Source files
 

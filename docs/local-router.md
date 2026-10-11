@@ -2,9 +2,12 @@
 
 ## User-facing
 
-User chỉ nhập **hostname đích** (vd. `gitlab.example.com:443`). App tự:
+User nhập **hostname hoặc IPv4 đích** (vd. `gitlab.example.com:443` hoặc
+`172.16.54.37:5432`). Với IPv4, app tự tạo hostname `{ip}.tunnel`.
+App tự:
 
 - Ghi hosts → `127.0.0.1 gitlab.example.com`
+- Ghi hosts → `127.0.0.2 172.16.54.37.tunnel`
 - Mở router trên `:443` (HTTPS) hoặc `:80`/cổng khác (HTTP)
 - Chuyển traffic tới cổng nội bộ (49100–49999) mà SSH `-L` đang listen
 
@@ -48,7 +51,9 @@ RouteKey { hostname, public_port }  // public_port = remotePort (443, 80, …)
 
 ## IP đích
 
-Nếu `remoteHost` parse được là IP → **bỏ qua router**, bind thẳng `127.0.0.1:remotePort`.
+Nếu `remoteHost` là IPv4, app route qua hostname `{ip}.tunnel`.
+`ActivatedMapping.remote_host` vẫn giữ IP thật để SSH mở `direct-tcpip`
+đúng tới đích.
 
 ## Source files
 
