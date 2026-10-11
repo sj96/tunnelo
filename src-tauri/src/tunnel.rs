@@ -7,13 +7,16 @@
 use crate::bastion_resolve;
 use crate::host_keys;
 use crate::local_router::ActivatedMapping;
-use crate::model::{format_local_access_url, SshAuth, TunnelProfile, TunnelState, TunnelStatus};
+use crate::model::{
+    format_local_access_url, ip_route_hostname, SshAuth, TunnelProfile, TunnelState, TunnelStatus,
+};
 use crate::secrets;
 use crate::AppState;
 use anyhow::{bail, Context, Result};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -36,6 +39,37 @@ enum Outcome {
 struct RunningTunnel {
     shutdown: watch::Sender<bool>,
     task: tauri::async_runtime::JoinHandle<()>,
+}
+
+struct MappingTraffic {
+    bytes_up: AtomicU64,
+    bytes_down: AtomicU64,
+    active_connections: AtomicU32,
+}
+
+impl MappingTraffic {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            bytes_up: AtomicU64::new(0),
+            bytes_down: AtomicU64::new(0),
+            active_connections: AtomicU32::new(0),
+        })
+    }
+}
+
+struct ActiveConnection(Arc<MappingTraffic>);
+
+impl ActiveConnection {
+    fn new(stats: Arc<MappingTraffic>) -> Self {
+        stats.active_connections.fetch_add(1, Ordering::Relaxed);
+        Self(stats)
+    }
+}
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.0.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Default)]
@@ -177,24 +211,44 @@ fn is_benign_forward_close(err: &std::io::Error) -> bool {
     ) || matches!(err.raw_os_error(), Some(10053) | Some(10054))
 }
 
-/// Relay bytes between local TCP and SSH channel; shutdown write-half when one side EOFs.
+/// Relay bytes between local TCP and SSH channel while counting both directions.
 async fn relay_forward(
     socket: &mut TcpStream,
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    stats: Arc<MappingTraffic>,
 ) -> std::io::Result<()> {
     let (mut cr, mut cw) = socket.split();
     let (mut sr, mut sw) = tokio::io::split(stream);
     tokio::select! {
-        r = tokio::io::copy(&mut cr, &mut sw) => {
+        r = relay_direction(&mut cr, &mut sw, &stats.bytes_up) => {
             r?;
-            let _ = sw.shutdown().await;
         }
-        r = tokio::io::copy(&mut sr, &mut cw) => {
+        r = relay_direction(&mut sr, &mut cw, &stats.bytes_down) => {
             r?;
-            let _ = cw.shutdown().await;
         }
     }
     Ok(())
+}
+
+async fn relay_direction<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    counter: &AtomicU64,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = tokio::io::AsyncReadExt::read(reader, &mut buffer).await?;
+        if read == 0 {
+            writer.shutdown().await?;
+            return Ok(());
+        }
+        writer.write_all(&buffer[..read]).await?;
+        counter.fetch_add(read as u64, Ordering::Relaxed);
+    }
 }
 
 fn log_forward_close(app: &AppHandle, id: &str, e: std::io::Error) {
@@ -271,7 +325,7 @@ async fn supervise(app: &AppHandle, profile: &TunnelProfile, mut shutdown: watch
             None,
         );
 
-        match run_tunnel(app, profile, &bindings, &mut shutdown).await {
+        match run_tunnel(app, profile, &bindings, &mut shutdown, !reconnecting).await {
             Ok(Outcome::Shutdown) => break,
             Ok(Outcome::Lost) => {
                 if !profile.auto_reconnect || *shutdown.borrow() {
@@ -357,13 +411,14 @@ async fn run_tunnel(
     profile: &TunnelProfile,
     bindings: &[ActivatedMapping],
     shutdown: &mut watch::Receiver<bool>,
+    allow_bastion_scan: bool,
 ) -> Result<Outcome> {
     let id = &profile.id;
     if bindings.is_empty() {
         bail!("no port forwards configured");
     }
 
-    let session = match connect_session(app, profile, shutdown).await {
+    let session = match connect_session(app, profile, shutdown, allow_bastion_scan).await {
         Ok(handle) => Arc::new(handle),
         Err(e) if is_shutdown(&e) => return Ok(Outcome::Shutdown),
         Err(e) => return Err(e),
@@ -378,8 +433,12 @@ async fn run_tunnel(
     let (forward_shutdown, forward_shutdown_rx) = watch::channel(false);
     let mut forward_tasks = Vec::with_capacity(bindings.len());
     let mut local_urls = Vec::with_capacity(bindings.len());
+    let mapping_stats: Vec<(String, Arc<MappingTraffic>)> = bindings
+        .iter()
+        .map(|mapping| (mapping.mapping_id.clone(), MappingTraffic::new()))
+        .collect();
 
-    for mapping in bindings {
+    for (mapping, (_, stats)) in bindings.iter().zip(mapping_stats.iter()) {
         let allow_port_fallback = mapping.remote_host.parse::<std::net::IpAddr>().is_ok();
         let (task, bind_port) = spawn_local_forward(
             app,
@@ -392,6 +451,7 @@ async fn run_tunnel(
             mapping.remote_host.clone(),
             mapping.remote_port,
             allow_port_fallback,
+            stats.clone(),
         )
         .await
         .with_context(|| {
@@ -416,10 +476,21 @@ async fn run_tunnel(
         local_urls.push(if bind_port == mapping.bind_port {
             mapping.access_url.clone()
         } else {
+            let access_host = ip_route_hostname(&mapping.remote_host)
+                .unwrap_or_else(|| mapping.remote_host.clone());
+            let access_scheme = if mapping.access_url.starts_with("https://") {
+                Some("https")
+            } else if mapping.access_url.starts_with("http://") {
+                Some("http")
+            } else if mapping.access_url.starts_with("tcp://") {
+                Some("tcp")
+            } else {
+                None
+            };
             format_local_access_url(
-                &mapping.remote_host,
+                &access_host,
                 bind_port,
-                None,
+                access_scheme,
                 &mapping.bind_host,
             )
         });
@@ -461,7 +532,18 @@ async fn run_tunnel(
         None,
     );
 
+    let connected_since_ms = now_ms();
+    let mut previous_bytes: Vec<(u64, u64)> = mapping_stats
+        .iter()
+        .map(|(_, stats)| {
+            (
+                stats.bytes_up.load(Ordering::Relaxed),
+                stats.bytes_down.load(Ordering::Relaxed),
+            )
+        })
+        .collect();
     let mut tick = tokio::time::interval(Duration::from_secs(5));
+    let mut stats_tick = tokio::time::interval(Duration::from_secs(1));
     let outcome = loop {
         tokio::select! {
             res = shutdown.changed() => {
@@ -474,6 +556,32 @@ async fn run_tunnel(
                     emit_log(app, id, LogLevel::Warn, "Session closed by server");
                     break Outcome::Lost;
                 }
+            }
+            _ = stats_tick.tick() => {
+                let mut snapshots = Vec::with_capacity(mapping_stats.len());
+                for (index, (mapping_id, stats)) in mapping_stats.iter().enumerate() {
+                    let bytes_up = stats.bytes_up.load(Ordering::Relaxed);
+                    let bytes_down = stats.bytes_down.load(Ordering::Relaxed);
+                    let (previous_up, previous_down) = previous_bytes[index];
+                    previous_bytes[index] = (bytes_up, bytes_down);
+                    snapshots.push(serde_json::json!({
+                        "mappingId": mapping_id,
+                        "bytesUp": bytes_up,
+                        "bytesDown": bytes_down,
+                        "bytesUpPerSec": bytes_up.saturating_sub(previous_up),
+                        "bytesDownPerSec": bytes_down.saturating_sub(previous_down),
+                        "activeConnections": stats.active_connections.load(Ordering::Relaxed),
+                    }));
+                }
+                let _ = app.emit(
+                    "tunnel://stats",
+                    serde_json::json!({
+                        "id": id,
+                        "ts": now_ms(),
+                        "connectedSinceMs": connected_since_ms,
+                        "mappings": snapshots,
+                    }),
+                );
             }
         }
     };
@@ -493,6 +601,7 @@ async fn connect_session(
     app: &AppHandle,
     profile: &TunnelProfile,
     shutdown: &mut watch::Receiver<bool>,
+    allow_bastion_scan: bool,
 ) -> Result<Handle<ClientHandler>> {
     loop {
         if *shutdown.borrow() {
@@ -506,7 +615,7 @@ async fn connect_session(
                     bail!(ShutdownRequested);
                 }
             }
-            res = connect_with_bastion_resolve(app, profile, &mut shutdown_scan) => return res,
+            res = connect_with_bastion_resolve(app, profile, &mut shutdown_scan, allow_bastion_scan) => return res,
         }
     }
 }
@@ -515,23 +624,12 @@ async fn connect_with_bastion_resolve(
     app: &AppHandle,
     profile: &TunnelProfile,
     shutdown: &mut watch::Receiver<bool>,
+    allow_bastion_scan: bool,
 ) -> Result<Handle<ClientHandler>> {
     let state = app.state::<AppState>();
-    let is_wildcard = bastion_resolve::is_wildcard_host(&profile.ssh.host);
-    let had_cache = is_wildcard && state.tunnels.get_resolved_bastion(&profile.id).is_some();
-
     let resolved =
-        resolve_bastion_host(app, profile, &state.tunnels, shutdown, false).await?;
-    match connect_session_inner(app, profile, &resolved).await {
-        Ok(handle) => Ok(handle),
-        Err(e) if is_shutdown(&e) => Err(e),
-        Err(_e) if is_wildcard && had_cache => {
-            let resolved =
-                resolve_bastion_host(app, profile, &state.tunnels, shutdown, true).await?;
-            connect_session_inner(app, profile, &resolved).await
-        }
-        Err(e) => Err(e),
-    }
+        resolve_bastion_host(app, profile, &state.tunnels, shutdown, allow_bastion_scan).await?;
+    connect_session_inner(app, profile, &resolved).await
 }
 
 async fn resolve_bastion_host(
@@ -539,7 +637,7 @@ async fn resolve_bastion_host(
     profile: &TunnelProfile,
     manager: &TunnelManager,
     shutdown: &mut watch::Receiver<bool>,
-    force_rescan: bool,
+    allow_scan: bool,
 ) -> Result<String> {
     let pattern = &profile.ssh.host;
     if !bastion_resolve::is_wildcard_host(pattern) {
@@ -547,18 +645,12 @@ async fn resolve_bastion_host(
     }
 
     let id = &profile.id;
-    if !force_rescan {
-        if let Some(cached) = manager.get_resolved_bastion(id) {
-            return Ok(cached);
-        }
-    } else if let Some(cached) = manager.get_resolved_bastion(id) {
-        emit_log(
-            app,
-            id,
-            LogLevel::Scan,
-            &format!("Cached {cached} unreachable — rescanning"),
-        );
-        manager.resolved_bastion.lock().remove(id);
+    if let Some(cached) = manager.get_resolved_bastion(id) {
+        return Ok(cached);
+    }
+
+    if !allow_scan {
+        bail!("no cached bastion for {pattern} — stop and reconnect to rescan");
     }
 
     let candidates = bastion_resolve::expand_wildcard(pattern)
@@ -631,6 +723,7 @@ async fn spawn_local_forward(
     remote_host: String,
     remote_port: u16,
     allow_port_fallback: bool,
+    stats: Arc<MappingTraffic>,
 ) -> Result<(JoinHandle<()>, u16)> {
     let (listener, bind_port) =
         bind_local_listener(&local_host, local_port, allow_port_fallback).await?;
@@ -658,6 +751,8 @@ async fn spawn_local_forward(
                     let id = id.clone();
                     let origin_host = peer.ip().to_string();
                     let origin_port = peer.port();
+                    let connection = ActiveConnection::new(stats.clone());
+                    let stats = stats.clone();
                     tokio::spawn(async move {
                         let open = tokio::time::timeout(
                             REMOTE_FORWARD_TIMEOUT,
@@ -672,7 +767,7 @@ async fn spawn_local_forward(
                         match open {
                             Ok(Ok(channel)) => {
                                 let mut stream = channel.into_stream();
-                                if let Err(e) = relay_forward(&mut socket, &mut stream).await {
+                                if let Err(e) = relay_forward(&mut socket, &mut stream, stats).await {
                                     log_forward_close(&app, &id, e);
                                 }
                             }
@@ -697,6 +792,7 @@ async fn spawn_local_forward(
                                 let _ = socket.shutdown().await;
                             }
                         }
+                        drop(connection);
                     });
                 }
             }
