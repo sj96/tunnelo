@@ -1,6 +1,11 @@
 // Mirrors the Rust data model in src-tauri/src/model.rs.
 
-import { formatForwardInput, formatLocalAccessUrl, isIpAddress } from "./urlUtils";
+import {
+  formatForwardInput,
+  formatLocalAccessUrl,
+  ipRouteHostname,
+  isIpAddress,
+} from "./urlUtils";
 import type { RemoteScheme } from "./urlUtils";
 
 export type SshAuth =
@@ -17,6 +22,7 @@ export interface SshConfig {
 
 export interface ForwardMapping {
   id: string;
+  pinned: boolean;
   /** Target host as seen from the SSH bastion. */
   remoteHost: string;
   remotePort: number;
@@ -71,9 +77,26 @@ export interface TunnelState {
   retryAtMs?: number | null;
 }
 
+export interface MappingTrafficSnapshot {
+  mappingId: string;
+  bytesUp: number;
+  bytesDown: number;
+  bytesUpPerSec: number;
+  bytesDownPerSec: number;
+  activeConnections: number;
+}
+
+export interface TunnelStatsEvent {
+  id: string;
+  ts: number;
+  connectedSinceMs: number;
+  mappings: MappingTrafficSnapshot[];
+}
+
 export function emptyMapping(): ForwardMapping {
   return {
     id: "",
+    pinned: false,
     remoteHost: "",
     remotePort: 443,
   };
@@ -107,7 +130,8 @@ export function mappingForwardTarget(m: ForwardMapping): string {
 
 /** Local endpoint to connect or copy once the tunnel is active. */
 export function mappingLocalUrl(m: ForwardMapping): string {
-  return formatLocalAccessUrl(m.remoteHost, m.remotePort, effectiveRemoteScheme(m));
+  const host = ipRouteHostname(m.remoteHost) ?? m.remoteHost;
+  return formatLocalAccessUrl(host, m.remotePort, effectiveRemoteScheme(m));
 }
 
 /** @deprecated Use mappingLocalUrl for connected access; mappingForwardTarget for remote target. */
