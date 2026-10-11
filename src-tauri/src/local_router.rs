@@ -1,7 +1,9 @@
 //! Global local routing orchestrator — hosts, per-domain loopback IPs, SSH bind.
 
 use crate::hosts;
-use crate::model::{format_local_access_url, format_remote_url, ForwardMapping};
+use crate::model::{
+    format_local_access_url, format_remote_url, ip_route_hostname, ForwardMapping,
+};
 use anyhow::{bail, Context, Result};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -91,7 +93,7 @@ impl LocalRouter {
                 bail!("each mapping needs a valid remote port");
             }
 
-            if is_ip_address(&remote_host) {
+            if is_ipv6_address(&remote_host) {
                 let access_url = format_local_access_url(
                     &remote_host,
                     mapping.remote_port,
@@ -109,32 +111,34 @@ impl LocalRouter {
                 continue;
             }
 
-            let hostname = remote_host;
+            let is_ip_route = ip_route_hostname(&remote_host).is_some();
+            let hostname = ip_route_hostname(&remote_host).unwrap_or_else(|| remote_host.clone());
             let public_port = mapping.remote_port;
-            let loopback_ip = reserve_domain_route(
-                &mut routes,
-                &mut state,
-                &hostname,
-                public_port,
-            )?;
+            let loopback_ip =
+                reserve_domain_route(&mut routes, &mut state, &hostname, public_port)?;
 
             let key = RouteKey {
                 hostname: hostname.clone(),
                 public_port,
             };
 
-            let access_url = format_remote_url(
-                &hostname,
-                public_port,
-                mapping.remote_scheme.as_deref(),
-            );
+            let access_url = if is_ip_route {
+                format_local_access_url(
+                    &hostname,
+                    public_port,
+                    mapping.remote_scheme.as_deref().or(Some("tcp")),
+                    &loopback_ip,
+                )
+            } else {
+                format_remote_url(&hostname, public_port, mapping.remote_scheme.as_deref())
+            };
 
             pending.push(TunnelRegistration { key });
             activated.push(ActivatedMapping {
                 mapping_id: mapping.id.clone(),
                 bind_host: loopback_ip.clone(),
                 bind_port: public_port,
-                remote_host: hostname.clone(),
+                remote_host: remote_host.clone(),
                 remote_port: mapping.remote_port,
                 access_url,
             });
@@ -145,14 +149,12 @@ impl LocalRouter {
         state.sync_hosts_locked(&self.routes)?;
 
         for m in &activated {
-            if !is_ip_address(&m.remote_host) {
-                tracing::info!(
-                    "routing {} → {}:{}",
-                    m.access_url,
-                    m.bind_host,
-                    m.bind_port
-                );
-            }
+            tracing::info!(
+                "routing {} → {}:{}",
+                m.access_url,
+                m.bind_host,
+                m.bind_port
+            );
         }
 
         Ok(activated)
@@ -215,8 +217,8 @@ impl RouterState {
     }
 }
 
-fn is_ip_address(host: &str) -> bool {
-    host.parse::<std::net::IpAddr>().is_ok()
+fn is_ipv6_address(host: &str) -> bool {
+    host.parse::<std::net::Ipv6Addr>().is_ok()
 }
 
 fn reserve_domain_route(
@@ -330,6 +332,7 @@ mod tests {
         let router = LocalRouter::new();
         let mapping = ForwardMapping {
             id: "m1".into(),
+            pinned: false,
             remote_host: "172.16.54.37:5432".into(),
             remote_port: 5432,
             remote_scheme: None,
@@ -343,8 +346,49 @@ mod tests {
         assert_eq!(activated[0].bind_host, "127.0.0.1");
         assert_eq!(activated[0].bind_port, 5432);
         assert_eq!(activated[0].remote_host, "172.16.54.37");
-        assert_eq!(activated[0].access_url, "tcp://127.0.0.1:5432");
+        assert_eq!(
+            activated[0].access_url,
+            "tcp://172.16.54.37.tunnel:5432"
+        );
         router.deactivate_tunnel("t1");
+    }
+
+    #[test]
+    fn two_ip_forwards_on_same_port_get_distinct_loopback_ips() {
+        let router = LocalRouter::new();
+        let mappings = [
+            ForwardMapping {
+                id: "ip-1".into(),
+                pinned: false,
+                remote_host: "172.16.54.37".into(),
+                remote_port: 5432,
+                remote_scheme: Some("tcp".into()),
+                local_host: String::new(),
+                local_port: 0,
+                public_host: String::new(),
+                subdomain: String::new(),
+            },
+            ForwardMapping {
+                id: "ip-2".into(),
+                pinned: false,
+                remote_host: "172.16.54.38".into(),
+                remote_port: 5432,
+                remote_scheme: Some("tcp".into()),
+                local_host: String::new(),
+                local_port: 0,
+                public_host: String::new(),
+                subdomain: String::new(),
+            },
+        ];
+
+        let activated = router.activate_tunnel("ip-tunnel", &mappings).unwrap();
+        assert_eq!(activated[0].bind_host, "127.0.0.1");
+        assert_eq!(activated[1].bind_host, "127.0.0.2");
+        assert_eq!(
+            activated[1].access_url,
+            "tcp://172.16.54.38.tunnel:5432"
+        );
+        router.deactivate_tunnel("ip-tunnel");
     }
 
     #[test]
@@ -354,6 +398,7 @@ mod tests {
         let router = LocalRouter::new();
         let mapping = ForwardMapping {
             id: "m2".into(),
+            pinned: false,
             remote_host: "app.example.com:443".into(),
             remote_port: 443,
             remote_scheme: None,

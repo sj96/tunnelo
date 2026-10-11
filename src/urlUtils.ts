@@ -2,6 +2,13 @@ export type RemoteScheme = "http" | "https" | "tcp" | null;
 
 export type ParsedTarget = { host: string; port: number; scheme: RemoteScheme };
 
+export const TUNNEL_LOCAL_SUFFIX = "tunnel";
+
+export function ipRouteHostname(ip: string): string | null {
+  if (!isIpAddress(ip)) return null;
+  return `${ip}.${TUNNEL_LOCAL_SUFFIX}`;
+}
+
 /** Parse remote target from URL or host:port. */
 export function parseRemoteTarget(raw: string): ParsedTarget | null {
   const s = raw.trim();
@@ -67,7 +74,10 @@ export function normalizeRemoteHost(raw: string): string {
 export function isIpAddress(host: string): boolean {
   if (host.startsWith("[")) return true;
   const parts = host.split(".");
-  return parts.length === 4 && parts.every((p) => /^\d{1,3}$/.test(p));
+  return (
+    parts.length === 4 &&
+    parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) >= 0 && Number(p) <= 255)
+  );
 }
 
 /** Display string for Port Forwards input (preserves http/https or bare host:port). */
@@ -103,7 +113,11 @@ export function formatLocalAccessUrl(
   const h = normalizeRemoteHost(host);
   if (!h) return "";
 
-  if (scheme === "tcp" || isIpAddress(h)) {
+  const routedHost = ipRouteHostname(h) ?? h;
+  if (scheme === "tcp") {
+    return `tcp://${routedHost}:${port}`;
+  }
+  if (isIpAddress(h)) {
     return `tcp://${bindHost}:${port}`;
   }
   if (scheme === "https") {

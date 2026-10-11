@@ -1,8 +1,8 @@
 import { forwardRef, useEffect, useImperativeHandle, useState } from "react";
 
 import type { ForwardMapping } from "../types";
-import { mappingForwardTarget } from "../types";
-import { parseRemoteTarget, formatForwardInput } from "../urlUtils";
+import { mappingForwardTarget, mappingLocalUrl } from "../types";
+import { isIpAddress, parseRemoteTarget, formatForwardInput } from "../urlUtils";
 
 export interface MappingRowHandle {
   commit: () => Partial<ForwardMapping> | false;
@@ -84,9 +84,16 @@ export const MappingRow = forwardRef<MappingRowHandle, Props>(function MappingRo
           />
           {remoteErr && <span className="field-hint err">{remoteErr}</span>}
           {!remoteErr && valid && !focused && (
-            <span className="field-hint ok">
-              → {mapping.remoteHost}:{mapping.remotePort} via bastion
-            </span>
+            <>
+              <span className="field-hint ok">
+                → {mapping.remoteHost}:{mapping.remotePort} via bastion
+              </span>
+              {isIpAddress(mapping.remoteHost) && (
+                <span className="field-hint ok">
+                  Kết nối qua {mappingLocalUrl(mapping)} (app tự ghi hosts)
+                </span>
+              )}
+            </>
           )}
         </label>
       </div>

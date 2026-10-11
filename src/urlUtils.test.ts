@@ -6,6 +6,8 @@ import {
 
   formatForwardInput,
 
+  ipRouteHostname,
+
   parseRemoteTarget,
 
 } from "./urlUtils";
@@ -222,16 +224,21 @@ describe("parseRemoteTarget + formatForwardInput round-trip", () => {
 
     expect(formatAccessUrl("172.16.54.37", 5432, "tcp")).toBe(
 
-      "tcp://127.0.0.1:5432",
+      "tcp://172.16.54.37.tunnel:5432",
 
     );
 
     expect(formatAccessUrl("172.16.54.37", 15432, "tcp")).toBe(
 
-      "tcp://127.0.0.1:15432",
+      "tcp://172.16.54.37.tunnel:15432",
 
     );
 
+  });
+
+  it("maps IPv4 forwards to tunnel hostnames", () => {
+    expect(ipRouteHostname("10.0.0.5")).toBe("10.0.0.5.tunnel");
+    expect(ipRouteHostname("999.0.0.5")).toBeNull();
   });
 
 

@@ -3,6 +3,14 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub const TUNNEL_LOCAL_SUFFIX: &str = "tunnel";
+
+/// Build the local hostname used to route an IPv4 forward through the hosts file.
+pub fn ip_route_hostname(ipv4: &str) -> Option<String> {
+    let ip = ipv4.parse::<std::net::Ipv4Addr>().ok()?;
+    Some(format!("{ip}.{TUNNEL_LOCAL_SUFFIX}"))
+}
+
 /// How the SSH client authenticates to the server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -52,6 +60,8 @@ fn default_remote_port() -> u16 {
 #[serde(rename_all = "camelCase")]
 pub struct ForwardMapping {
     pub id: String,
+    #[serde(default)]
+    pub pinned: bool,
     /// Target host as seen from the SSH bastion, e.g. `gitlab.example.com`.
     #[serde(default)]
     pub remote_host: String,
@@ -80,8 +90,10 @@ impl ForwardMapping {
 
     /// Local endpoint the user connects to once routing is active.
     pub fn local_access_url(&self) -> String {
+        let host = ip_route_hostname(&normalize_remote_host(&self.remote_host))
+            .unwrap_or_else(|| normalize_remote_host(&self.remote_host));
         format_local_access_url(
-            &self.remote_host,
+            &host,
             self.remote_port,
             self.remote_scheme.as_deref(),
             "127.0.0.1",
@@ -163,7 +175,11 @@ pub fn format_local_access_url(
 
     let remote_scheme = effective_remote_scheme(&host, port, remote_scheme);
 
-    if remote_scheme.as_deref() == Some("tcp") || is_ip_address(&host) {
+    if remote_scheme.as_deref() == Some("tcp") {
+        return format!("tcp://{host}:{port}");
+    }
+
+    if is_ip_address(&host) {
         return format!("tcp://{bind_host}:{port}");
     }
 
@@ -256,6 +272,7 @@ impl TunnelProfile {
             };
             self.mappings.push(ForwardMapping {
                 id: ForwardMapping::new_id(),
+                pinned: false,
                 remote_host: remote_host.clone(),
                 remote_port: if self.local_service.port != 0 {
                     self.local_service.port
@@ -326,11 +343,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn format_local_access_url_tcp_uses_loopback() {
+    fn format_local_access_url_tcp_uses_ip_route_hostname() {
         assert_eq!(
             format_local_access_url("172.16.54.37", 5432, Some("tcp"), "127.0.0.1"),
-            "tcp://127.0.0.1:5432"
+            "tcp://172.16.54.37:5432"
         );
+    }
+
+    #[test]
+    fn ip_route_hostname_uses_tunnel_suffix() {
+        assert_eq!(
+            ip_route_hostname("172.16.54.37"),
+            Some("172.16.54.37.tunnel".into())
+        );
+        assert_eq!(ip_route_hostname("not-an-ip"), None);
     }
 
     #[test]
@@ -342,9 +368,10 @@ mod tests {
     }
 
     #[test]
-    fn local_access_url_on_mapping_uses_loopback_for_ip() {
+    fn local_access_url_on_mapping_uses_ip_route_hostname() {
         let m = ForwardMapping {
             id: "m1".into(),
+            pinned: false,
             remote_host: "172.16.54.37".into(),
             remote_port: 5432,
             remote_scheme: Some("tcp".into()),
@@ -353,7 +380,10 @@ mod tests {
             public_host: String::new(),
             subdomain: String::new(),
         };
-        assert_eq!(m.local_access_url(), "tcp://127.0.0.1:5432");
+        assert_eq!(
+            m.local_access_url(),
+            "tcp://172.16.54.37.tunnel:5432"
+        );
     }
 
     #[test]
