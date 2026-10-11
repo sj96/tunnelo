@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { openUrl } from "@tauri-apps/plugin-opener";
-import type { TunnelProfile, TunnelStatus } from "../types";
+import type { TunnelProfile, TunnelStatsEvent, TunnelStatus } from "../types";
 import { isWildcardBastionHost } from "../bastionHost";
-import { effectiveRemoteScheme, mappingForwardTarget, mappingLocalUrl } from "../types";
-import { isWebForward } from "../urlUtils";
+import { mappingForwardTarget, mappingLocalUrl } from "../types";
+import { TunnelMonitor } from "./TunnelMonitor";
+import type { TrafficPoint } from "./TunnelMonitor";
 
 interface Props {
   profile: TunnelProfile;
@@ -12,12 +12,16 @@ interface Props {
   localUrls?: string[];
   resolvedBastionHost?: string | null;
   retryAtMs?: number | null;
+  stats?: TunnelStatsEvent;
+  statsHistory?: Record<string, TrafficPoint[]>;
+  aggregateHistory?: TrafficPoint[];
   busy: boolean;
   onStart: () => void;
   onStop: () => void;
   onEdit: () => void;
   onDelete: () => void;
   onForgetHostKey: () => void;
+  onTogglePin: (mappingId: string) => void;
 }
 
 const STATUS_LABEL: Record<TunnelStatus, string> = {
@@ -63,12 +67,16 @@ export function TunnelCard({
   localUrls,
   resolvedBastionHost,
   retryAtMs,
+  stats,
+  statsHistory,
+  aggregateHistory,
   busy,
   onStart,
   onStop,
   onEdit,
   onDelete,
   onForgetHostKey,
+  onTogglePin,
 }: Props) {
   const retrySecsLeft = useRetryCountdown(status === "reconnecting" ? retryAtMs : null);
   const statusLabel =
@@ -94,17 +102,24 @@ export function TunnelCard({
     return () => document.removeEventListener("pointerdown", onPointerDown);
   }, [menuOpen]);
 
-  async function copyUrl(url: string) {
-    try {
-      await navigator.clipboard.writeText(url);
-    } catch {
-      /* clipboard unavailable */
-    }
-  }
+  const orderedMappings = profile.mappings
+    .map((mapping, index) => ({ mapping, index }))
+    .sort((a, b) => Number(b.mapping.pinned) - Number(a.mapping.pinned));
+  const aggregateRates = stats?.mappings.reduce(
+    (total, mapping) => ({
+      down: total.down + mapping.bytesDownPerSec,
+      up: total.up + mapping.bytesUpPerSec,
+    }),
+    { down: 0, up: 0 },
+  );
 
   return (
-    <article className={`tunnel-row${menuOpen ? " menu-open" : ""}`} role="listitem">
+    <article
+      className={`tunnel-row${profile.mappings.length > 0 ? " has-forwards" : ""}${menuOpen ? " menu-open" : ""}`}
+      role="listitem"
+    >
       <div className="tunnel-row-body">
+        <div className="tunnel-header">
         <div className="tunnel-row-head">
           <span className={`status-dot ${status}`} title={statusLabel} aria-label={statusLabel} />
           <span className="tunnel-name">{profile.name}</span>
@@ -130,48 +145,88 @@ export function TunnelCard({
             </span>
           )}
         </p>
+        </div>
+
+        {status === "connected" && (
+          <TunnelMonitor
+            aggregate
+            history={aggregateHistory ?? []}
+            aggregateRates={aggregateRates}
+          />
+        )}
 
         {profile.mappings.length > 0 && (
-          <div className="tunnel-row-forwards">
-            {profile.mappings.map((m, index) => {
-              const accessUrl =
-                status === "connected" && localUrls?.[index]
-                  ? localUrls[index]
-                  : mappingLocalUrl(m);
-              const forwardTarget = mappingForwardTarget(m);
-              const connected = status === "connected" && m.remoteHost;
-              const scheme = effectiveRemoteScheme(m);
-              const isBrowserUrl = isWebForward(scheme);
-              const copyTitle = isBrowserUrl ? "Copy URL" : "Copy local address";
-
-              return (
-                <span className="forward-chip" key={m.id || m.remoteHost}>
-                  {connected ? (
-                    <>
-                      {isBrowserUrl ? (
-                        <button type="button" className="forward-link" onClick={() => openUrl(accessUrl)}>
-                          {accessUrl}
-                        </button>
-                      ) : (
-                        <span className="forward-link forward-link-static">{accessUrl}</span>
+          <section className="tunnel-forward-section" aria-label="Configured forwards">
+            <div className="tunnel-forward-section-head">
+              <strong>Forwards</strong>
+              <span>{profile.mappings.length}</span>
+            </div>
+            <div className="tunnel-forward-list">
+              {orderedMappings.map(({ mapping: m, index }) => {
+                const accessUrl = localUrls?.[index] ?? mappingLocalUrl(m);
+                const forwardTarget = mappingForwardTarget(m);
+                const mappingKey = m.id || `${m.remoteHost}:${m.remotePort}`;
+                const snapshot = stats?.mappings.find((item) => item.mappingId === m.id);
+                const stateLabel =
+                  status === "connected"
+                    ? undefined
+                    : status === "connecting"
+                      ? "Connecting…"
+                      : status === "reconnecting"
+                        ? "Reconnecting…"
+                        : status === "error"
+                          ? "Unavailable"
+                          : "Not connected";
+                return (
+                  <div className="tunnel-forward-group" key={mappingKey}>
+                    <div className={`tunnel-forward-item${status === "connected" ? "" : " idle"}`}>
+                      <div className="forward-item-target">
+                        <span className={`forward-status-dot ${snapshot ? "active" : ""}`} />
+                        <div>
+                          <strong title={forwardTarget}>{forwardTarget || "…"}</strong>
+                          <span title={accessUrl}>{accessUrl}</span>
+                        </div>
+                      </div>
+                      {status === "connected" && (
+                        <TunnelMonitor
+                          snapshot={snapshot}
+                          history={statsHistory?.[m.id] ?? []}
+                        />
                       )}
-                      <button
-                        type="button"
-                        className="icon-btn icon-btn-sm"
-                        title={copyTitle}
-                        onClick={() => copyUrl(accessUrl)}
-                      >
-                        ⧉
-                      </button>
-                    </>
-                  ) : (
-                    <span className="forward-idle">{forwardTarget || "…"}</span>
-                  )}
-                </span>
-              );
-            })}
-          </div>
+                      <span className="forward-item-connections">
+                        {snapshot ? `${snapshot.activeConnections} conn.` : stateLabel ?? "—"}
+                      </span>
+                      <div className="forward-item-actions">
+                        <span
+                          className={`forward-pin${m.pinned ? " pinned" : ""}`}
+                          role="button"
+                          tabIndex={0}
+                          aria-pressed={m.pinned}
+                          aria-label={m.pinned ? "Unpin forward" : "Pin forward"}
+                          title={m.pinned ? "Unpin forward" : "Pin forward"}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            onTogglePin(m.id);
+                          }}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" || event.key === " ") {
+                              event.preventDefault();
+                              event.stopPropagation();
+                              onTogglePin(m.id);
+                            }
+                          }}
+                        >
+                          {m.pinned ? "★" : "☆"}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
         )}
+
       </div>
 
       <div className="tunnel-row-actions">

@@ -4,8 +4,10 @@ import { api } from "./api";
 import { ConsolePanel } from "./components/ConsolePanel";
 import { TunnelCard } from "./components/TunnelCard";
 import { TunnelForm, type SecretInput } from "./components/TunnelForm";
+import type { TrafficPoint } from "./components/TunnelMonitor";
 import {
   emptyProfile,
+  type TunnelStatsEvent,
   type TunnelProfile,
   type TunnelState,
   type TunnelStatus,
@@ -38,6 +40,11 @@ function App() {
   const [resolvedBastions, setResolvedBastions] = useState<Record<string, string | null>>({});
   const [localUrls, setLocalUrls] = useState<Record<string, string[]>>({});
   const [retryAtMs, setRetryAtMs] = useState<Record<string, number | null>>({});
+  const [stats, setStats] = useState<Record<string, TunnelStatsEvent>>({});
+  const [statsHistory, setStatsHistory] = useState<
+    Record<string, Record<string, { ts: number; up: number; down: number }[]>>
+  >({});
+  const [aggregateHistory, setAggregateHistory] = useState<Record<string, TrafficPoint[]>>({});
   const [busy, setBusy] = useState<Record<string, boolean>>({});
   const [editing, setEditing] = useState<TunnelProfile | null>(null);
   const [toast, setToast] = useState<{ msg: string; info?: boolean } | null>(null);
@@ -78,8 +85,20 @@ function App() {
       if (s.localUrls !== undefined) {
         setLocalUrls((prev) => ({ ...prev, [s.id]: s.localUrls ?? [] }));
       }
-      if (s.status === "stopped" || s.status === "error") {
+      if (s.status === "stopped" || s.status === "error" || s.status === "reconnecting") {
         setLocalUrls((prev) => {
+          const { [s.id]: _, ...rest } = prev;
+          return rest;
+        });
+        setStats((prev) => {
+          const { [s.id]: _, ...rest } = prev;
+          return rest;
+        });
+        setStatsHistory((prev) => {
+          const { [s.id]: _, ...rest } = prev;
+          return rest;
+        });
+        setAggregateHistory((prev) => {
           const { [s.id]: _, ...rest } = prev;
           return rest;
         });
@@ -94,11 +113,41 @@ function App() {
         notify(s.error);
       }
     });
+    const unStats = listen<TunnelStatsEvent>("tunnel://stats", (e) => {
+      const event = e.payload;
+      setStats((prev) => ({ ...prev, [event.id]: event }));
+      setStatsHistory((prev) => {
+        const current = prev[event.id] ?? {};
+        const next: Record<string, { ts: number; up: number; down: number }[]> = {};
+        for (const mapping of event.mappings) {
+          next[mapping.mappingId] = [
+            ...(current[mapping.mappingId] ?? []),
+            { ts: event.ts, up: mapping.bytesUpPerSec, down: mapping.bytesDownPerSec },
+          ].slice(-900);
+        }
+        return { ...prev, [event.id]: next };
+      });
+      const aggregate = event.mappings.reduce(
+        (total, mapping) => ({
+          down: total.down + mapping.bytesDownPerSec,
+          up: total.up + mapping.bytesUpPerSec,
+        }),
+        { down: 0, up: 0 },
+      );
+      setAggregateHistory((prev) => ({
+        ...prev,
+        [event.id]: [
+          ...(prev[event.id] ?? []),
+          { ts: event.ts, down: aggregate.down, up: aggregate.up },
+        ].slice(-900),
+      }));
+    });
     const unProfiles = listen("tunnel://profiles-changed", () => {
       refresh().catch((e) => notify(String(e)));
     });
     return () => {
       unState.then((f) => f());
+      unStats.then((f) => f());
       unProfiles.then((f) => f());
     };
   }, []);
@@ -152,6 +201,24 @@ function App() {
       setEditing(null);
       await refresh();
     } catch (e) {
+      notify(String(e));
+    }
+  }
+
+  async function handleTogglePin(tunnelId: string, mappingId: string) {
+    const current = tunnels.find((tunnel) => tunnel.id === tunnelId);
+    if (!current) return;
+    const updated: TunnelProfile = {
+      ...current,
+      mappings: current.mappings.map((mapping) =>
+        mapping.id === mappingId ? { ...mapping, pinned: !mapping.pinned } : mapping,
+      ),
+    };
+    setTunnels((prev) => prev.map((tunnel) => (tunnel.id === tunnelId ? updated : tunnel)));
+    try {
+      await api.saveTunnel(updated);
+    } catch (e) {
+      await refresh();
       notify(String(e));
     }
   }
@@ -248,12 +315,16 @@ function App() {
                     localUrls={localUrls[t.id]}
                     resolvedBastionHost={resolvedBastions[t.id]}
                     retryAtMs={retryAtMs[t.id]}
+                    stats={stats[t.id]}
+                    statsHistory={statsHistory[t.id]}
+                    aggregateHistory={aggregateHistory[t.id]}
                     busy={!!busy[t.id]}
                     onStart={() => handleStart(t.id)}
                     onStop={() => handleStop(t.id)}
                     onEdit={() => setEditing(t)}
                     onDelete={() => handleDelete(t.id)}
                     onForgetHostKey={() => handleForgetHostKey(t)}
+                    onTogglePin={(mappingId) => handleTogglePin(t.id, mappingId)}
                   />
                 ))}
               </div>

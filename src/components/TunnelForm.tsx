@@ -358,7 +358,7 @@ export function TunnelForm({ initial, onSave, onCancel, standalone = false }: Pr
             <span className="form-section-badge">{p.mappings.length}</span>
           </div>
           <p className="form-footnote">
-            http/https URL, tcp://host:port, hoặc IP:port — ví dụ: https://hrm.mservice.com.vn, tcp://172.16.54.37:5432
+            http/https URL, tcp://host:port, or IP:port — for example: https://hrm.mservice.com.vn, tcp://172.16.54.37:5432
           </p>
           <div className="form-section-card">
             <div className="mapping-list">
